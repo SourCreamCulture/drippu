@@ -10,15 +10,21 @@
 #include "core/recompiler/arm64_to_c.h"
 #include "smoke_config.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
+#ifdef _WIN32
+#include <process.h>
+#endif
 
 namespace fs = std::filesystem;
 using suyu::recomp::u32;
@@ -45,9 +51,43 @@ std::string Quote(const std::string& s) {
 #endif
 }
 
-int Run(const std::string& cmd) {
-    std::cout << "+ " << cmd << std::endl;
-    return std::system(cmd.c_str());
+int RunArgs(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        fail("empty command");
+        return 1;
+    }
+    std::cout << '+';
+    for (const auto& a : args) {
+        std::cout << ' ' << Quote(a);
+    }
+    std::cout << std::endl;
+#ifdef _WIN32
+    // std::system() is cmd.exe /c, which strips the first/last quote when the
+    // line has several quoted tokens — so "C:/Program Files/CMake/..." becomes
+    // C:/Program. Spawn the argv list instead.
+    std::vector<const char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) {
+        argv.push_back(a.c_str());
+    }
+    argv.push_back(nullptr);
+    const intptr_t rc =
+        _spawnv(_P_WAIT, args[0].c_str(), reinterpret_cast<const char* const*>(argv.data()));
+    if (rc < 0) {
+        fail(std::string("spawn ") + args[0] + ": " + std::strerror(errno));
+        return 1;
+    }
+    return static_cast<int>(rc);
+#else
+    std::ostringstream cmd;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) {
+            cmd << ' ';
+        }
+        cmd << Quote(args[i]);
+    }
+    return std::system(cmd.str().c_str());
+#endif
 }
 
 bool WriteFile(const fs::path& path, std::string_view text) {
@@ -124,26 +164,37 @@ bool AesHelpersAtFileScope(const std::string& runtime_c) {
 
 int CmakeBuild(const fs::path& src, const fs::path& build, const char* target,
                bool iso_c11) {
-    std::ostringstream cfg;
-    cfg << Quote(SUYU_SMOKE_CMAKE) << " -S " << Quote(src.string()) << " -B "
-        << Quote(build.string()) << " -DCMAKE_BUILD_TYPE=Release";
+    std::vector<std::string> cfg{SUYU_SMOKE_CMAKE, "-S", src.string(), "-B",
+                                 build.string(), "-DCMAKE_BUILD_TYPE=Release"};
+    const std::string gen = SUYU_SMOKE_GENERATOR;
+    if (!gen.empty()) {
+        cfg.push_back("-G");
+        cfg.push_back(gen);
+    }
+    const std::string plat = SUYU_SMOKE_GENERATOR_PLATFORM;
+    if (!plat.empty()) {
+        cfg.push_back("-A");
+        cfg.push_back(plat);
+    }
     if (iso_c11) {
         // Probe sources are ISO C11. The generated runtime uses POSIX
         // nanosleep, so it is compiled with the host compiler defaults.
-        cfg << " -DCMAKE_C_STANDARD=11 -DCMAKE_C_EXTENSIONS=OFF";
+        cfg.emplace_back("-DCMAKE_C_STANDARD=11");
+        cfg.emplace_back("-DCMAKE_C_EXTENSIONS=OFF");
     }
     const std::string cc = SUYU_SMOKE_C_COMPILER;
-    if (!cc.empty()) {
-        cfg << " -DCMAKE_C_COMPILER=" << Quote(cc);
+    // The Visual Studio generator selects cl.exe itself; passing a
+    // CMAKE_C_COMPILER path is unnecessary and can confuse the cache.
+    if (!cc.empty() && gen.rfind("Visual Studio", 0) != 0) {
+        cfg.push_back(std::string("-DCMAKE_C_COMPILER=") + cc);
     }
-    if (Run(cfg.str()) != 0) {
+    if (RunArgs(cfg) != 0) {
         fail("cmake configure " + src.string());
         return 1;
     }
-    std::ostringstream bld;
-    bld << Quote(SUYU_SMOKE_CMAKE) << " --build " << Quote(build.string())
-        << " --config Release --target " << target;
-    if (Run(bld.str()) != 0) {
+    const std::vector<std::string> bld{SUYU_SMOKE_CMAKE, "--build", build.string(),
+                                       "--config", "Release", "--target", target};
+    if (RunArgs(bld) != 0) {
         fail("cmake build " + std::string(target) + " in " + build.string());
         return 1;
     }
@@ -274,7 +325,7 @@ void TestBranchProbes(const fs::path& root) {
         fail("branch_probe executable not found under " + probe_build.string());
         return;
     }
-    if (Run(Quote(exe.string())) != 0) {
+    if (RunArgs({exe.string()}) != 0) {
         fail("branch_probe execution");
         return;
     }

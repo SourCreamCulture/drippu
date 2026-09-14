@@ -26,6 +26,8 @@ target_include_directories(exporter_smoke PRIVATE
 
 file(TO_CMAKE_PATH "${CMAKE_COMMAND}" SUYU_SMOKE_CMAKE)
 file(TO_CMAKE_PATH "${CMAKE_C_COMPILER}" SUYU_SMOKE_C_COMPILER)
+set(SUYU_SMOKE_GENERATOR "${CMAKE_GENERATOR}")
+set(SUYU_SMOKE_GENERATOR_PLATFORM "${CMAKE_GENERATOR_PLATFORM}")
 configure_file(smoke_config.h.in smoke_config.h @ONLY)
 
 add_test(NAME exporter_smoke COMMAND exporter_smoke)
