@@ -11,7 +11,7 @@ Do not boot copyrighted titles, dump keys, or install firmware you do not alread
 
 ## Launch
 
-Build (Ubuntu/Debian, from the repo root). System libfmt 9 on Ubuntu 24.04 cannot compile this tree (`format.get()` needs fmt 10+); SDL3 is also not packaged. Use GCC — `/usr/bin/c++` is often Clang and fails to link `libstdc++`. CMake must be 3.31+ (CPMUtil).
+Build (Ubuntu/Debian, from the repo root). System libfmt 9 on Ubuntu 24.04 cannot compile this tree (`format.get()` needs fmt 10+); SDL3 is also not packaged. Bundled FFmpeg 8 needs `vaMapBuffer2` from a newer libva than Ubuntu 24.04 ships, so leave `YUZU_USE_BUNDLED_FFMPEG=OFF` and use distro libav*. Use GCC — `/usr/bin/c++` is often Clang and fails to link `libstdc++`. CMake must be 3.31+ (CPMUtil).
 
 ```sh
 cmake -B build-verify -GNinja \
@@ -21,7 +21,7 @@ cmake -B build-verify -GNinja \
   -DENABLE_QT=ON \
   -DYUZU_USE_BUNDLED_QT=OFF \
   -DYUZU_USE_BUNDLED_SDL3=ON \
-  -DYUZU_USE_BUNDLED_FFMPEG=ON \
+  -DYUZU_USE_BUNDLED_FFMPEG=OFF \
   -Dfmt_FORCE_BUNDLED=ON \
   -DYUZU_TESTS=OFF \
   -DENABLE_QT_TRANSLATION=OFF \

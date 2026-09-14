@@ -76,6 +76,53 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def _hex_port(port: int) -> str:
+    return f"{port:04X}"
+
+
+def _proc_net_inodes(port: int) -> set[str]:
+    needle = _hex_port(port)
+    inodes: set[str] = set()
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        if not table.is_file():
+            continue
+        for line in table.read_text().splitlines()[1:]:
+            cols = line.split()
+            if len(cols) < 10:
+                continue
+            local = cols[1]
+            if not local.upper().endswith(":" + needle):
+                continue
+            # 0A = TCP_LISTEN
+            if cols[3] != "0A":
+                continue
+            inodes.add(cols[9])
+    return inodes
+
+
+def _pids_for_socket_inodes(inodes: set[str]) -> list[int]:
+    if not inodes:
+        return []
+    pids: set[int] = set()
+    proc = Path("/proc")
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        fd_dir = entry / "fd"
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target[8:-1] in inodes:
+                    pids.add(int(entry.name))
+                    break
+        except OSError:
+            continue
+    return sorted(pids)
+
+
 def listeners_on_port(port: int) -> list[int]:
     try:
         out = subprocess.check_output(
@@ -83,19 +130,21 @@ def listeners_on_port(port: int) -> list[int]:
             text=True,
             stderr=subprocess.DEVNULL,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-    pids: list[int] = []
-    for line in out.splitlines():
-        if "pid=" not in line:
-            continue
-        for chunk in line.split("pid="):
-            if chunk is line:
+        pids: list[int] = []
+        for line in out.splitlines():
+            if "pid=" not in line:
                 continue
-            digits = "".join(ch for ch in chunk if ch.isdigit())
-            if digits:
-                pids.append(int(digits))
-    return sorted(set(pids))
+            for chunk in line.split("pid="):
+                if chunk is line:
+                    continue
+                digits = "".join(ch for ch in chunk if ch.isdigit())
+                if digits:
+                    pids.append(int(digits))
+        if pids:
+            return sorted(set(pids))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    return _pids_for_socket_inodes(_proc_net_inodes(port))
 
 
 def tcp_ready(host: str, port: int, timeout: float = 0.4) -> bool:

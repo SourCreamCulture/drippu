@@ -42,3 +42,4 @@ Preconditions:
 - `Load a Game` / `launch_game_path` needs a ROM (and usually keys). Do not call them on the empty-library recipe.
 - First-run **Welcome to suyu** blocks the event loop if `first_run_done` was not seeded. Doctor then times out on MCP.
 - `set_gamer_search_filter` forces Gamer mode. Call it after mode-switch tests, not in the middle of a Programmer assertion.
+- That tool invokes `OnSearchChanged` directly, so `get_ui_state.search_filter` updates while the search box can still show the placeholder `Search your games...`. Assert the MCP field, not the placeholder text.
