@@ -1280,11 +1280,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         }
     }
 
-    // Host C + * / sqrt and integer<->FP casts use the host rounding mode and
-    // never write FPSR. Guest FPCR/FPSR live in the context so MSR/MRS
-    // round-trip and Dynarmic can apply them on fallback, but these emitters
-    // do not read the fields. Off until generated C honours architectural
-    // control. Same shape as kTranslateFixedPointConversions.
     constexpr bool kTranslateHostFpArithmetic = false;
 
     // FADDP, scalar: add the two lanes of the source together.

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Standalone (and optionally nested) exporter smoke: EmitProject compile,
-# RET/BLR branch probes, and FPCR/FPSR control checks against arm64_to_c.h.
-# Does not use tools/static_recompiler.
+# Standalone (and optionally nested) exporter smoke: EmitProject compile plus
+# RET/BLR branch probes against the active arm64_to_c.h header. Does not use
+# tools/static_recompiler.
 
 cmake_minimum_required(VERSION 3.13)
 

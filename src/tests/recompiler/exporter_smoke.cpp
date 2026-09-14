@@ -4,8 +4,6 @@
 // Portable acceptance check for the active AArch64 exporter (arm64_to_c.h):
 //   1. EmitProject on a tiny supported sequence, then CMake-compile the project
 //   2. RET Rn / BLR X30 probes compiled and executed as permanent regressions
-//   3. FPCR/FPSR: guest rounding and exception status are either applied by
-//      generated C or the instruction is left unhandled for Dynarmic
 //
 // Deliberately does not invoke tools/static_recompiler.
 
@@ -162,13 +160,10 @@ constexpr u32 kSvc0 = 0xD4000001u;
 constexpr u32 kRetX5 = 0xD65F00A0u;
 constexpr u32 kRetX30 = 0xD65F03C0u;
 constexpr u32 kBlrX30 = 0xD63F03C0u;
-// MRS/MSR sysreg packing: o0 op1 CRn CRm op2. FPCR=0x5A20, FPSR=0x5A21.
 constexpr u32 kMsrFpcrX0 = 0xD51B4400u;
 constexpr u32 kMrsX0Fpcr = 0xD53B4400u;
 constexpr u32 kMrsX1Fpsr = 0xD53B4421u;
-// FADD D2, D0, D1. Inexact 1.0 + 2^-53 distinguishes RMode RP from RM/RN.
 constexpr u32 kFaddD2D0D1 = 0x1E612802u;
-// Other host-C FP families. Each must honor FPCR or fall through.
 constexpr u32 kFmulD2D0D1 = 0x1E610802u;
 constexpr u32 kFdivD2D0D1 = 0x1E611802u;
 constexpr u32 kFsqrtD0D1 = 0x1E61C020u;
@@ -453,8 +448,6 @@ void TestFpControl(const fs::path& root) {
         return;
     }
 
-    // Host C arithmetic is still being emitted. Execute it under two guest
-    // rounding modes. Architectural RP must round 1.0+2^-53 up; RM must not.
     std::ostringstream src;
     src << "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n"
            "typedef struct {\n"
