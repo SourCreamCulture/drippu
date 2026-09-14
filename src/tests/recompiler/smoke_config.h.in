@@ -1,0 +1,4 @@
+#pragma once
+
+#define SUYU_SMOKE_CMAKE "@SUYU_SMOKE_CMAKE@"
+#define SUYU_SMOKE_C_COMPILER "@SUYU_SMOKE_C_COMPILER@"
