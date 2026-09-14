@@ -10,11 +10,9 @@
 #include "core/recompiler/arm64_to_c.h"
 #include "smoke_config.h"
 
-#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -23,7 +21,8 @@
 #include <string_view>
 #include <vector>
 #ifdef _WIN32
-#include <process.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -43,12 +42,53 @@ void pass(const std::string& msg) {
     std::cout << "PASS: " << msg << std::endl;
 }
 
+#ifndef _WIN32
 std::string Quote(const std::string& s) {
-#ifdef _WIN32
-    return "\"" + s + "\"";
-#else
     return "'" + s + "'";
+}
 #endif
+
+std::string QuoteWinArg(std::string_view arg) {
+    // CommandLineToArgvW rules: quote if empty or if space/tab/quote present;
+    // double backslashes that precede a quote; double trailing backslashes
+    // before the closing quote.
+    const bool need_quote =
+        arg.empty() || arg.find_first_of(" \t\n\v\"") != std::string_view::npos;
+    if (!need_quote) {
+        return std::string(arg);
+    }
+    std::string out;
+    out.push_back('"');
+    size_t slashes = 0;
+    for (char c : arg) {
+        if (c == '\\') {
+            ++slashes;
+            continue;
+        }
+        if (c == '"') {
+            out.append(slashes * 2 + 1, '\\');
+            out.push_back('"');
+            slashes = 0;
+            continue;
+        }
+        out.append(slashes, '\\');
+        slashes = 0;
+        out.push_back(c);
+    }
+    out.append(slashes * 2, '\\');
+    out.push_back('"');
+    return out;
+}
+
+std::string JoinWindowsCommandLine(const std::vector<std::string>& args) {
+    std::string line;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) {
+            line.push_back(' ');
+        }
+        line += QuoteWinArg(args[i]);
+    }
+    return line;
 }
 
 int RunArgs(const std::vector<std::string>& args) {
@@ -56,29 +96,34 @@ int RunArgs(const std::vector<std::string>& args) {
         fail("empty command");
         return 1;
     }
+#ifdef _WIN32
+    // _spawnv concatenates argv with spaces and does not quote, so
+    // "C:/Program Files/CMake/..." and "Visual Studio 18 2026" split. Build a
+    // CommandLineToArgvW-compatible line and CreateProcess it.
+    const std::string cmdline = JoinWindowsCommandLine(args);
+    std::cout << "+ " << cmdline << std::endl;
+    std::vector<char> buf(cmdline.begin(), cmdline.end());
+    buf.push_back('\0');
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, 0, nullptr,
+                        nullptr, &si, &pi)) {
+        fail("CreateProcess " + args[0] + ": error " + std::to_string(GetLastError()));
+        return 1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return static_cast<int>(code);
+#else
     std::cout << '+';
     for (const auto& a : args) {
         std::cout << ' ' << Quote(a);
     }
     std::cout << std::endl;
-#ifdef _WIN32
-    // std::system() is cmd.exe /c, which strips the first/last quote when the
-    // line has several quoted tokens — so "C:/Program Files/CMake/..." becomes
-    // C:/Program. Spawn the argv list instead.
-    std::vector<const char*> argv;
-    argv.reserve(args.size() + 1);
-    for (const auto& a : args) {
-        argv.push_back(a.c_str());
-    }
-    argv.push_back(nullptr);
-    const intptr_t rc =
-        _spawnv(_P_WAIT, args[0].c_str(), reinterpret_cast<const char* const*>(argv.data()));
-    if (rc < 0) {
-        fail(std::string("spawn ") + args[0] + ": " + std::strerror(errno));
-        return 1;
-    }
-    return static_cast<int>(rc);
-#else
     std::ostringstream cmd;
     for (size_t i = 0; i < args.size(); ++i) {
         if (i) {
