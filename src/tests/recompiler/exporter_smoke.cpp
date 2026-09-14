@@ -177,6 +177,7 @@ constexpr u32 kScvtfD0X1 = 0x9E620020u;
 constexpr u32 kFaddpD0V1 = 0x7E70D820u;
 constexpr u32 kFaddV0V1V2_2d = 0x4E62D420u;
 constexpr u32 kFmlaV0V1V2_2d = 0x4E62CC20u;
+constexpr u32 kFabsD0D1 = 0x1E60C020u;
 
 bool AesHelpersAtFileScope(const std::string& runtime_c) {
     const auto save = runtime_c.find("int recomp_save_write(");
@@ -430,6 +431,13 @@ void TestFpControl(const fs::path& root) {
         return;
     }
     pass("MSR/MRS FPCR translated C stores and loads the field");
+
+    const std::string fabsd = TranslateInsn(kFabsD0D1, 0x1000);
+    if (BodyUnhandled(fabsd) || fabsd.find("fabs") == std::string::npos) {
+        fail("FABS Dd should stay translated: " + fabsd);
+    } else {
+        pass("FABS Dd stays bitwise translated");
+    }
 
     ExpectFpControlledOrUnhandled("FADD Dd", kFaddD2D0D1);
     ExpectFpControlledOrUnhandled("FMUL Dd", kFmulD2D0D1);
