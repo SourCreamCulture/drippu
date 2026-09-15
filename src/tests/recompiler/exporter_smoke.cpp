@@ -12,6 +12,7 @@
 #include "core/arm/recomp/unresolved_import.h"
 #include "smoke_config.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -21,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -746,6 +748,40 @@ void TestModuleRegistrationSession() {
         fail("title switch still has the previous main base");
     } else {
         pass("switching titles re-registers main");
+    }
+
+    session.DetachProcess(&process_b);
+    RecompSession cores;
+    int process_c = 3;
+    cores.AttachProcess(&process_c);
+    SessionDispatcher core_disp;
+    std::atomic<int> registrations{0};
+    const SessionModule aslr_cores[] = {
+        {"rtld", 0x7400000000ULL},
+        {"main", 0x7400200000ULL},
+        {"nnSdk", 0x7401000000ULL},
+    };
+    auto register_cores = [&] {
+        cores.EnsureModuleBasesRegistered([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            registrations.fetch_add(1, std::memory_order_relaxed);
+            RegisterModules(core_disp, aslr_cores, 3);
+        });
+    };
+    std::thread t0(register_cores);
+    std::thread t1(register_cores);
+    std::thread t2(register_cores);
+    std::thread t3(register_cores);
+    t0.join();
+    t1.join();
+    t2.join();
+    t3.join();
+    if (const int n = registrations.load(std::memory_order_relaxed); n != 1) {
+        fail("four cores registered bases " + std::to_string(n) + " times");
+    } else if (core_disp.bases[1].base != 0x7400200000ULL) {
+        fail("four cores did not publish the ASLR main base");
+    } else {
+        pass("four cores register once and wait");
     }
 }
 

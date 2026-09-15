@@ -20,32 +20,36 @@ public:
     bool AttachProcess(const void* process) {
         std::lock_guard<std::mutex> lock{mu_};
         if (process_ == process) {
+            ++owners_;
             return false;
         }
         process_ = process;
+        owners_ = 1;
+        ResetLocked();
         return true;
     }
 
     void DetachProcess(const void* process) {
         std::lock_guard<std::mutex> lock{mu_};
-        if (process_ == process) {
-            process_ = nullptr;
+        if (process_ != process || owners_ == 0) {
+            return;
         }
-    }
-
-    const void* process() const {
-        std::lock_guard<std::mutex> lock{mu_};
-        return process_;
+        if (--owners_ == 0) {
+            process_ = nullptr;
+            ResetLocked();
+        }
     }
 
     // Runs `register_all` once for the current process. Other cores that
     // arrive at the same time wait until that call has finished.
     template <typename Fn>
     void EnsureModuleBasesRegistered(Fn&& register_all) {
-        if (!bases_registered_) {
-            bases_registered_ = true;
-            std::forward<Fn>(register_all)();
+        std::lock_guard<std::mutex> lock{mu_};
+        if (bases_registered_) {
+            return;
         }
+        std::forward<Fn>(register_all)();
+        bases_registered_ = true;
     }
 
     void NoteStaticBlock() {
@@ -57,8 +61,14 @@ public:
     }
 
 private:
-    mutable std::mutex mu_;
+    void ResetLocked() {
+        bases_registered_ = false;
+        static_blocks_.store(0, std::memory_order_relaxed);
+    }
+
+    std::mutex mu_;
     const void* process_{nullptr};
+    unsigned owners_{0};
     bool bases_registered_{false};
     std::atomic<std::uint64_t> static_blocks_{0};
 };
