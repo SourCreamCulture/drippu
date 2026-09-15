@@ -688,7 +688,7 @@ int main(int argc, char** argv) {
 
     // Preferred path: modules compiled straight into this executable. Nothing
     // to find on disk, nothing to load, and no version skew between the exe and
-    // its modules. Identity and order still come from the image ABI.
+    // its modules.
 #ifdef SUYU_CMD_STATIC_RECOMP
     {
         unsigned count = 0;
