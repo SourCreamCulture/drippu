@@ -110,10 +110,10 @@ def tokenize(expr: str) -> list[str]:
         \s+
         | '([^']*)'
         | "([^"]*)"
-        | [A-Za-z_][A-Za-z0-9_.]*
+        | [A-Za-z_][A-Za-z0-9_-]*
         | && | \|\|
         | == | !=
-        | [()!]
+        | [()!.]
     """
     tokens: list[str] = []
     for match in re.finditer(spec, expr, re.VERBOSE):
@@ -675,6 +675,18 @@ def main() -> int:
     )
     check.expect(empty_trace.created_tag is None, "empty artifacts do not create a release")
     check.expect(empty_trace.exit_code != 0, "empty artifacts fail the publish step")
+
+    print("--- drive: linux artifact missing, jobs reported success ---")
+    partial_trace = run_publish_shell(spec, sample_artifacts(missing={"linux"}), commit=commit)
+    partial_kinds = [event.kind for event in partial_trace.events]
+    print(partial_trace.stdout)
+    print(f"events: {partial_kinds}")
+    print(f"exit: {partial_trace.exit_code}")
+    check.expect(
+        "delete" not in partial_kinds and "create" not in partial_kinds,
+        "missing required linux artifact does not delete or publish",
+    )
+    check.expect(partial_trace.exit_code != 0, "missing required linux artifact fails publish")
 
     print("--- drive: required artifacts present ---")
     full_trace = run_publish_shell(spec, sample_artifacts(), commit=commit)
