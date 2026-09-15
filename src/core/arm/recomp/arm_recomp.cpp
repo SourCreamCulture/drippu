@@ -1153,7 +1153,7 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
         // The budget bounds that chain, and what is left of it afterwards says
         // how many blocks actually ran - without which every count here would
         // report chains rather than blocks.
-        impl->ctx.chain_budget = impl->icache.AllowsAotChain() ? kChainBudget : 0;
+        impl->ctx.chain_budget = impl->icache.AllowsAot() ? kChainBudget : 0;
         block(&impl->ctx);
         {
             const int spent = kChainBudget - impl->ctx.chain_budget;
@@ -1236,7 +1236,7 @@ void ArmRecomp::ClearInstructionCache() {
 }
 
 void ArmRecomp::InvalidateCacheRange(u64 addr, std::size_t size) {
-    impl->icache.InvalidateRange(addr, size);
+    impl->icache.Clear();
     impl->ctx.chain_budget = 0;
     if (impl->fallback) {
         impl->fallback->InvalidateCacheRange(addr, size);

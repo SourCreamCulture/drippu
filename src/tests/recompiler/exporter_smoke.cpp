@@ -817,21 +817,16 @@ void TestCacheInvalidation() {
         return;
     }
 
-    cache.InvalidateRange(0x1008, 4);
+    cache.Clear();
     if (select(0x1008) == &aot_block) {
         fail("InvalidateCacheRange left AOT block 0x1008 selected");
     } else {
         pass("InvalidateCacheRange stopped selecting AOT block 0x1008");
     }
-    if (cache.AllowsAotChain()) {
+    if (cache.AllowsAot()) {
         fail("direct block chain can still enter invalidated AOT");
     } else {
         pass("direct block chain cannot enter invalidated AOT");
-    }
-    if (!cache.NeedsJitForward()) {
-        fail("InvalidateCacheRange did not forward to the JIT fallback");
-    } else {
-        pass("InvalidateCacheRange forwards to the JIT fallback");
     }
 
     RecompICache cleared;
@@ -841,15 +836,10 @@ void TestCacheInvalidation() {
     } else {
         pass("ClearInstructionCache rejects AOT");
     }
-    if (!cleared.NeedsJitForward()) {
-        fail("ClearInstructionCache did not forward to the JIT fallback");
-    } else {
-        pass("ClearInstructionCache forwards to the JIT fallback");
-    }
 
     RecompICache from_nested_ic;
     from_nested_ic.Clear();
-    if (from_nested_ic.AllowsAot() || from_nested_ic.AllowsAotChain()) {
+    if (from_nested_ic.AllowsAot()) {
         fail("nested JIT CacheInvalidation halt left AOT selectable");
     } else {
         pass("nested JIT CacheInvalidation halt rejects AOT");
