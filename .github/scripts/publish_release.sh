@@ -106,5 +106,4 @@ gh release create "$tag" \
   --title "suyu v0.04 ${short}" \
   --notes-file "$notes" \
   --prerelease \
-  --latest \
   "${assets[@]}"
