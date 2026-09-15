@@ -846,6 +846,14 @@ void TestCacheInvalidation() {
     } else {
         pass("ClearInstructionCache forwards to the JIT fallback");
     }
+
+    RecompICache from_nested_ic;
+    from_nested_ic.Clear();
+    if (from_nested_ic.AllowsAot() || from_nested_ic.AllowsAotChain()) {
+        fail("nested JIT CacheInvalidation halt left AOT selectable");
+    } else {
+        pass("nested JIT CacheInvalidation halt rejects AOT");
+    }
 }
 
 } // namespace

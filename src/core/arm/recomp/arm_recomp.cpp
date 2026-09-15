@@ -935,6 +935,10 @@ HaltReason ArmRecomp::RunFallback(Kernel::KThread* thread) {
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
+    if (True(hr & HaltReason::CacheInvalidation)) {
+        impl->icache.Clear();
+        impl->ctx.chain_budget = 0;
+    }
     if (True(hr & HaltReason::SupervisorCall)) {
         impl->ctx.pending_svc = impl->fallback->GetSvcNumber();
     }
