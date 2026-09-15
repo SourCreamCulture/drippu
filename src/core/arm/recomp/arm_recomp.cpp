@@ -867,9 +867,6 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
     impl->exclusive_monitor = exclusive_monitor;
     impl->core_index = core_index;
     impl->uses_wall_clock = uses_wall_clock;
-    // One instance is built per core. The first core of a process resets
-    // registration and coverage so a later title cannot inherit the previous
-    // image bases. The last core torn down clears the session.
     if (HostRecompSession().AttachProcess(process)) {
         g_counters.Reset();
         g_coverage_reported.store(false, std::memory_order_relaxed);
@@ -877,9 +874,6 @@ ArmRecomp::ArmRecomp(System& system, bool uses_wall_clock, RecompLookupFn lookup
 }
 
 ArmRecomp::~ArmRecomp() {
-    // Report on the first instance torn down. Waiting for the last one loses
-    // the measurement when a reference survives shutdown. The next process
-    // clears g_coverage_reported in AttachProcess.
     bool expected = false;
     if (g_coverage_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         ReportRecompCoverage();
@@ -959,12 +953,6 @@ HaltReason ArmRecomp::RunThread(Kernel::KThread* thread) {
 
     impl->RefreshPageTable();
 
-    // Registering every loaded image's base with the host dispatcher is a
-    // side effect of this call, not something its return value is used for
-    // here - the dispatcher needs it done once before the first lookup, or
-    // every image's base stays 0 and every lookup misses. The session owns
-    // that once-per-process gate so a later boot with new ASLR bases can run
-    // it again, and so cores wait until the setter has finished.
     HostRecompSession().EnsureModuleBasesRegistered(
         [&] { impl->ModuleBaseFor(thread, impl->ctx.pc); });
 

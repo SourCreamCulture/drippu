@@ -10,9 +10,6 @@
 
 namespace suyu::recomp {
 
-// Process-scoped AOT registration and coverage. Module bases change on every
-// boot (ASLR) and every title, so this state must not outlive the guest
-// process, and cores that share one process must wait for one registration.
 class RecompSession {
 public:
     // Binds this session to `process`. Returns true when the bound process
@@ -40,8 +37,6 @@ public:
         }
     }
 
-    // Runs `register_all` once for the current process. Other cores that
-    // arrive at the same time wait until that call has finished.
     template <typename Fn>
     void EnsureModuleBasesRegistered(Fn&& register_all) {
         std::lock_guard<std::mutex> lock{mu_};
@@ -73,4 +68,4 @@ private:
     std::atomic<std::uint64_t> static_blocks_{0};
 };
 
-} // namespace suyu::recomp
+}
