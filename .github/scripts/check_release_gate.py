@@ -317,9 +317,10 @@ if [ "${1:-}" = "release" ] && [ "${2:-}" = "delete" ]; then
 fi
 if [ "${1:-}" = "release" ] && [ "${2:-}" = "create" ]; then
   tag="$3"
-  echo "CREATED $tag" >> "$LOG"
   notes=""
   files=()
+  prerelease=0
+  latest=0
   shift 3
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -333,7 +334,11 @@ if [ "${1:-}" = "release" ] && [ "${2:-}" = "create" ]; then
       --repo=*|--title=*) ;;
       --notes=*) notes="${1#--notes=}" ;;
       --notes-file=*) notes="$(cat "${1#--notes-file=}")" ;;
-      --prerelease|--latest|--draft) shift ;;
+      --prerelease|--prerelease=true) prerelease=1; shift ;;
+      --prerelease=false) prerelease=0; shift ;;
+      --latest|--latest=true) latest=1; shift ;;
+      --latest=false) latest=0; shift ;;
+      --draft) shift ;;
       --*) shift ;;
       *)
         files+=("$1")
@@ -341,6 +346,13 @@ if [ "${1:-}" = "release" ] && [ "${2:-}" = "create" ]; then
         ;;
     esac
   done
+  if [ "$prerelease" -eq 1 ] && [ "$latest" -eq 1 ]; then
+    echo "HTTP 422: Validation Failed (https://api.github.com/repos/${GITHUB_REPOSITORY:-}/releases)" >&2
+    echo "Latest release cannot be draft or prerelease." >&2
+    echo "CLEANUP_DRAFT" >> "$LOG"
+    exit 1
+  fi
+  echo "CREATED $tag" >> "$LOG"
   printf '%s\\n' "$notes" > __NOTES__
   : > __CHECKSUMS__
   for f in "${files[@]+"${files[@]}"}"; do
@@ -422,6 +434,8 @@ exec /usr/bin/git "$@"
                 events.append(GhEvent("git-delete", parts[1:]))
             elif parts[0] == "UPLOAD":
                 events.append(GhEvent("upload", parts[1:]))
+            elif parts[0] == "CLEANUP_DRAFT":
+                events.append(GhEvent("cleanup-draft", []))
             elif parts[0] == "GH":
                 events.append(GhEvent("gh", parts[1:]))
 
@@ -667,6 +681,8 @@ def main() -> int:
     full_trace = run_publish_shell(spec, sample_artifacts(), commit=commit)
     full_kinds = [event.kind for event in full_trace.events]
     print(full_trace.stdout)
+    if full_trace.stderr:
+        print(full_trace.stderr)
     print(f"events: {full_kinds}")
     print(f"created_tag: {full_trace.created_tag}")
     print(f"notes: {full_trace.notes!r}")
