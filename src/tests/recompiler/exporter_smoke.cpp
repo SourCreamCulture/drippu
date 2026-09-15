@@ -8,6 +8,7 @@
 // Deliberately does not invoke tools/static_recompiler.
 
 #include "core/recompiler/arm64_to_c.h"
+#include "core/arm/recomp/unresolved_import.h"
 #include "smoke_config.h"
 
 #include <chrono>
@@ -547,6 +548,89 @@ void TestFpControl(const fs::path& root) {
     pass("FADD honors guest FPCR rounding");
 }
 
+void TestUnresolvedImportPolicy() {
+    using suyu::recomp::FindGuestReturnStub;
+    using suyu::recomp::FormatUnresolvedImportDiagnostic;
+    using suyu::recomp::IsUnresolvedImportTrap;
+    using suyu::recomp::kA64MovX0Zero;
+    using suyu::recomp::kA64Ret;
+    using suyu::recomp::kUnresolvedImportTrap;
+    using suyu::recomp::TakeUnresolvedImportTrap;
+    using suyu::recomp::UnresolvedImport;
+    using suyu::recomp::UnresolvedReloc;
+    using suyu::recomp::UnresolvedSlotTarget;
+    using suyu::recomp::UnresolvedTrapAction;
+
+    const u64 base = 0x7100000000ULL;
+    std::vector<u32> text(16, 0xD503201Fu);
+    text[4] = kA64Ret;
+    auto read32 = [&](u64 va) -> u32 {
+        const u64 i = (va - base) / 4;
+        return i < text.size() ? text[i] : 0;
+    };
+    const u64 bare = FindGuestReturnStub(base, read32, 64);
+    if (bare != base + 16) {
+        fail("FindGuestReturnStub missed the bare RET");
+        return;
+    }
+    if (UnresolvedSlotTarget(bare) != kUnresolvedImportTrap) {
+        fail("unresolved JUMP_SLOT still targets a guest RET stub");
+    } else {
+        pass("unresolved JUMP_SLOT uses the halt sentinel");
+    }
+
+    text[8] = kA64MovX0Zero;
+    text[9] = kA64Ret;
+    const u64 zero_ret = FindGuestReturnStub(base, read32, 64);
+    if (zero_ret != base + 32) {
+        fail("FindGuestReturnStub missed mov x0,#0; ret");
+        return;
+    }
+    if (UnresolvedSlotTarget(zero_ret) != kUnresolvedImportTrap) {
+        fail("unsupported IRELATIVE still targets mov x0,#0; ret");
+    } else {
+        pass("unsupported IRELATIVE uses the halt sentinel");
+    }
+    if (UnresolvedSlotTarget(0) != kUnresolvedImportTrap) {
+        fail("empty trap_va is not the halt sentinel");
+    } else {
+        pass("empty trap_va is the halt sentinel");
+    }
+
+    const std::vector<UnresolvedImport> recorded{
+        {"nn::fs::MountSdCard", base, 0x2000, UnresolvedReloc::JumpSlot},
+        {"", base, 0x2010, UnresolvedReloc::Irelative},
+    };
+    const auto hit = TakeUnresolvedImportTrap(0xDEADBEEFCAFEBABEULL, 0x7100001000ULL, recorded);
+    if (hit.action != UnresolvedTrapAction::Halt) {
+        fail("unresolved import trap still fakes a function return");
+    } else {
+        pass("unresolved import trap halts");
+    }
+    if (!IsUnresolvedImportTrap(kUnresolvedImportTrap)) {
+        fail("IsUnresolvedImportTrap rejects the sentinel");
+    }
+    if (hit.diagnostic.find("nn::fs::MountSdCard") == std::string::npos) {
+        fail("halt diagnostic missing symbol name: " + hit.diagnostic);
+    } else {
+        pass("halt diagnostic names the unresolved symbol");
+    }
+    if (hit.diagnostic.find("R_AARCH64_IRELATIVE") == std::string::npos) {
+        fail("halt diagnostic missing IRELATIVE: " + hit.diagnostic);
+    } else {
+        pass("halt diagnostic names unsupported IRELATIVE");
+    }
+
+    const std::string irel =
+        FormatUnresolvedImportDiagnostic("", base, 0x2010, UnresolvedReloc::Irelative);
+    if (irel.find("R_AARCH64_IRELATIVE") == std::string::npos ||
+        irel.find("<no name>") == std::string::npos) {
+        fail("IRELATIVE diagnostic is imprecise: " + irel);
+    } else {
+        pass("IRELATIVE diagnostic names the reloc and missing resolver");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -564,6 +648,7 @@ int main() {
     TestEmitProjectCompile(root);
     TestBranchProbes(root);
     TestFpControl(root);
+    TestUnresolvedImportPolicy();
 
     if (const char* ev = std::getenv("SUYU_SMOKE_EVIDENCE_DIR")) {
         const fs::path dest(ev);
