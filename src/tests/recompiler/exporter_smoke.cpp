@@ -869,6 +869,7 @@ void TestSharedImageAbi(const fs::path& root) {
     using suyu::recomp::ValidateImageExports;
     using suyu::recomp::kRecompBuildIdSize;
     using suyu::recomp::kRecompImageAbiVersion;
+    using suyu::recomp::kRecompMaxModules;
     using suyu::recomp::kRecompRegsPrefixSize;
 
     RecompImageExports lookup_only{};
@@ -985,6 +986,27 @@ void TestSharedImageAbi(const fs::path& root) {
         pass("sdk kept its own base when rtld was omitted");
     }
 
+    const auto* nn_main = SlotByName(map, "nnmain");
+    if (!nn_main || nn_main != main_slot) {
+        fail("nnmain did not match the main slot");
+    } else {
+        pass("nnmain matches main");
+    }
+
+    static RecompImageAbi unknown_abi = main_abi;
+    unknown_abi.module_index = kRecompMaxModules;
+    std::strncpy(unknown_abi.module_name, "abi", sizeof(unknown_abi.module_name) - 1);
+    RecompModuleMap unknown_map{};
+    RecompImageExports unknown_ex{};
+    unknown_ex.lookup = DummyLookup;
+    unknown_ex.set_base = +[](u64) {};
+    unknown_ex.abi = []() -> const RecompImageAbi* { return &unknown_abi; };
+    if (PlaceLoadedModule(unknown_map, unknown_ex) != ImageReject::IndexRange) {
+        fail("unknown module_index occupied a load slot");
+    } else {
+        pass("unknown module_index rejected as out of range");
+    }
+
     const fs::path out = root / "abi_export";
     fs::create_directories(out);
     u32 text[1] = {kSvc0};
@@ -1001,6 +1023,13 @@ void TestSharedImageAbi(const fs::path& root) {
         fail("EmitProject export has no content hash");
     } else {
         pass("EmitProject export carries a content hash");
+    }
+    const std::string unknown_index =
+        std::to_string(kRecompRegsPrefixSize) + "u,\n  " + std::to_string(kRecompMaxModules) + "u,";
+    if (generated.find(unknown_index) == std::string::npos) {
+        fail("EmitProject unknown name stored module_index 0");
+    } else {
+        pass("EmitProject unknown name emits out-of-range module_index");
     }
 }
 

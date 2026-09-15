@@ -6506,6 +6506,17 @@ ExpectedBuildIds LoadExpectedBuildIds(const QString& image_dir) {
     }
     return out;
 }
+
+QDir SkipCmakeBuildFolders(QDir dir) {
+    while (dir.dirName() == QStringLiteral("Release") ||
+           dir.dirName() == QStringLiteral("Debug") ||
+           dir.dirName() == QStringLiteral("build")) {
+        if (!dir.cdUp()) {
+            break;
+        }
+    }
+    return dir;
+}
 } // Anonymous namespace
 
 void GMainWindow::UnloadRecompiledImages() {
@@ -6629,14 +6640,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
 
         found.push_back(lib);
 
-        QDir owner = QFileInfo(lib->fileName()).absoluteDir();
-        while (owner.dirName() == QStringLiteral("Release") ||
-               owner.dirName() == QStringLiteral("Debug") ||
-               owner.dirName() == QStringLiteral("build")) {
-            if (!owner.cdUp()) {
-                break;
-            }
-        }
+        QDir owner = SkipCmakeBuildFolders(QFileInfo(lib->fileName()).absoluteDir());
         auto* get_index = reinterpret_cast<int (*)(u64*, u64*, Core::RecompBlockFn**)>(
             lib->resolve("recomp_image_index"));
         const suyu::recomp::RecompImageAbi* abi = ex.abi ? ex.abi() : nullptr;
@@ -6665,8 +6669,6 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir) {
     loaded_records = std::move(records);
     loaded_map = pending;
 
-    // Kernel module names carry an "nn" prefix that the export directories do
-    // not ("nnrtld" against "rtld"), so try both spellings.
     Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
         const std::string name = module ? module : "";
         suyu::recomp::ApplyModuleBase(loaded_map, index, name.c_str(), base);

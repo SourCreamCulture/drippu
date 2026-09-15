@@ -663,9 +663,6 @@ int main(int argc, char** argv) {
         rom_found:;
     }
 
-    // Native recompiled CPU modules, in NSO load order: rtld(0), main(1),
-    // subsdk0-N(2..N+1), sdk(last). Whichever way they arrive, registering any
-    // of them makes ArmRecomp run the game's CPU natively instead of dynarmic.
     using suyu::recomp::ApplyModuleBase;
     using suyu::recomp::ImageReject;
     using suyu::recomp::ImageRejectName;
@@ -686,9 +683,6 @@ int main(int argc, char** argv) {
         return true;
     };
 
-    // Preferred path: modules compiled straight into this executable. Nothing
-    // to find on disk, nothing to load, and no version skew between the exe and
-    // its modules.
 #ifdef SUYU_CMD_STATIC_RECOMP
     {
         unsigned count = 0;

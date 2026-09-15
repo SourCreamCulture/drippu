@@ -88,6 +88,21 @@ inline int ModuleIndexForName(std::string_view name) {
     return -1;
 }
 
+inline uint32_t ModuleIndexOrUnknown(std::string_view name) {
+    const int named = ModuleIndexForName(name);
+    return named >= 0 ? static_cast<uint32_t>(named) : kRecompMaxModules;
+}
+
+inline const char* WithoutNnPrefix(const char* name) {
+    if (!name) {
+        return name;
+    }
+    if (std::strncmp(name, "nn", 2) == 0 || std::strncmp(name, "NN", 2) == 0) {
+        return name + 2;
+    }
+    return name;
+}
+
 inline bool ParseBuildIdHex(std::string_view hex, uint8_t out[kRecompBuildIdSize]) {
     if (hex.size() != kRecompBuildIdSize * 2) {
         return false;
@@ -218,10 +233,7 @@ inline const RecompModuleSlot* SlotByName(const RecompModuleMap& map, const char
     if (!name || !name[0]) {
         return nullptr;
     }
-    const char* stripped = name;
-    if (std::strncmp(name, "nn", 2) == 0 || std::strncmp(name, "NN", 2) == 0) {
-        stripped = name + 2;
-    }
+    const char* stripped = WithoutNnPrefix(name);
     for (uint32_t i = 0; i < kRecompMaxModules; ++i) {
         const RecompImageAbi* abi = map.slots[i].abi;
         if (!abi) {
@@ -249,4 +261,4 @@ inline void ApplyModuleBase(RecompModuleMap& map, size_t index, const char* name
     }
 }
 
-} // namespace suyu::recomp
+}

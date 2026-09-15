@@ -1697,8 +1697,7 @@ QString GameExportDialog::RunAotPrecompile(const QString& exefs_dir,
         bool emit_ok = false;
         try {
             suyu::recomp::RecompImageIdentity identity{};
-            const int named = suyu::recomp::ModuleIndexForName(mod.name.toStdString());
-            identity.module_index = named >= 0 ? static_cast<uint32_t>(named) : 0;
+            identity.module_index = suyu::recomp::ModuleIndexOrUnknown(mod.name.toStdString());
             suyu::recomp::ParseBuildIdHex(mod.build_id_hex.toStdString(), identity.build_id);
             stats = suyu::recomp::EmitProject(
                 mod.name.toStdString(), mod.text_bytes.data(), mod.text_bytes.size(),

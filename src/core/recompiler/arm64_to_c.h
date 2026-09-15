@@ -3708,8 +3708,7 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     if (identity) {
         id = *identity;
     } else {
-        const int named = ModuleIndexForName(mod);
-        id.module_index = named >= 0 ? static_cast<uint32_t>(named) : 0;
+        id.module_index = ModuleIndexOrUnknown(mod);
     }
     std::string abi_name = mod;
     if (abi_name.size() >= kRecompModuleNameSize) {
