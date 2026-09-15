@@ -3,34 +3,48 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
 namespace suyu::recomp {
 
-// Tracks instruction-cache invalidation for hybrid AOT plus JIT fallback.
-// Matches ArmRecomp::ClearInstructionCache / InvalidateCacheRange today:
-// both are empty, so AOT stays selected and the JIT is not notified.
+// Instruction-cache invalidation for hybrid AOT plus JIT fallback.
+// AOT translations cannot be rewritten, so any invalidate rejects further AOT
+// selection and direct chains until this core is rebuilt. The JIT is notified
+// separately by the backend so it can drop its own translations.
 class RecompICache {
 public:
     void InvalidateRange(std::uint64_t addr, std::size_t size) {
         (void)addr;
         (void)size;
+        RejectAot();
     }
 
-    void Clear() {}
+    void Clear() {
+        RejectAot();
+    }
 
     bool AllowsAot() const {
-        return true;
+        return !aot_rejected_.load(std::memory_order_acquire);
     }
 
     bool AllowsAotChain() const {
-        return true;
+        return AllowsAot();
     }
 
     bool NeedsJitForward() const {
-        return false;
+        return jit_forward_.load(std::memory_order_acquire);
     }
+
+private:
+    void RejectAot() {
+        aot_rejected_.store(true, std::memory_order_release);
+        jit_forward_.store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> aot_rejected_{false};
+    std::atomic<bool> jit_forward_{false};
 };
 
 } // namespace suyu::recomp
