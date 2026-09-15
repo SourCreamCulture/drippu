@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""
-Drive GitHub Actions release-publication semantics against the workflow YAML.
-
-The matching surface is `.github/workflows/release.yml` plus the documented
-job `if` / `needs` rules, then the Publish Release shell as Actions would run
-it. A stub `gh` records delete vs create. Assertions encode the intended gate:
-required failures must not publish or delete, deletion must not precede the
-artifact check, and a published tag must be immutable with commit, toolchain,
-and checksum metadata.
-
-GitHub docs (workflow syntax, `jobs.<job_id>.needs`):
-If a needed job fails or is skipped, dependents are skipped unless `if`
-continues them. `if: always()` continues after any needed-job outcome.
-Expressions (status check functions): a default `success()` applies unless
-the `if` already contains `always()`, `success()`, `failure()`, or
-`cancelled()`. `always()` is true even when cancelled.
-"""
 
 from __future__ import annotations
 
@@ -103,6 +86,12 @@ def unwrap_expression(expr: str) -> str:
 
 def uses_status_check(expr: str) -> bool:
     return any(re.search(rf"\b{name}\s*\(", expr) for name in STATUS_FUNCS)
+
+
+def apply_github_default_success(expr: str) -> str:
+    if uses_status_check(expr):
+        return expr
+    return f"success() && ({expr})"
 
 
 def tokenize(expr: str) -> list[str]:
@@ -250,9 +239,7 @@ def evaluate_if(
     }
     if raw_if is None:
         return success()
-    expr = unwrap_expression(str(raw_if))
-    if not uses_status_check(expr):
-        expr = f"success() && ({expr})"
+    expr = apply_github_default_success(unwrap_expression(str(raw_if)))
     value = ExprEval(tokenize(expr), ctx).parse()
     return bool(value)
 
@@ -499,23 +486,11 @@ def workflow_has_test_suite_job(doc: dict[str, Any], text: str) -> bool:
     return False
 
 
-def deleted_before_artifact_check(spec: JobSpec) -> bool:
-    saw_delete = False
-    for name, script in publish_scripts(spec):
+def publish_deletes_a_release(spec: JobSpec) -> bool:
+    for _, script in publish_scripts(spec):
         if "gh release delete" in script or "git push --delete" in script:
-            saw_delete = True
-        if saw_delete and ("No artifacts to release" in script or "exit 1" in script):
             return True
-        if "gh release delete" in script and (
-            "No artifacts to release" in script or "find artifacts" in script
-        ):
-            delete_at = script.find("gh release delete")
-            check_at = script.find("No artifacts to release")
-            if check_at == -1:
-                check_at = script.find("find artifacts")
-            if check_at != -1 and delete_at < check_at:
-                return True
-    return saw_delete
+    return False
 
 
 def immutable_tag(tag: str | None) -> bool:
@@ -631,8 +606,8 @@ def main() -> int:
     )
 
     check.expect(
-        not deleted_before_artifact_check(spec),
-        "publish job does not delete a release or tag before the empty-artifact check",
+        not publish_deletes_a_release(spec),
+        "publish job does not delete a release or tag",
     )
     check.expect(
         workflow_has_aot_job(doc, text),
