@@ -686,9 +686,6 @@ struct ArmRecomp::Impl {
                 mem.Write64(d.mod_base + r_offset, d.mod_base + r_addend);
                 ++applied;
             } else if (r_type == R_AARCH64_IRELATIVE) {
-                // Resolver invocation needs a nested guest call this backend
-                // does not have. Write the halt sentinel so a later BLR stops
-                // instead of jumping to leftover file bytes.
                 LOG_ERROR(Core_ARM,
                           "recomp: IRELATIVE relocation at module base={:#x} offset={:#x} not "
                           "invoked (resolver call unsupported)",

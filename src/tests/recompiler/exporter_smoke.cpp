@@ -156,6 +156,7 @@ std::string ReadFile(const fs::path& path) {
 // AArch64 encodings used by the review's reproductions.
 constexpr u32 kMovzX0_5 = 0xD28000A0u;
 constexpr u32 kMovzX1_7 = 0xD28000E1u;
+constexpr u32 kMovX0Zero = 0xD2800000u;
 constexpr u32 kAddX2X0X1 = 0x8B010002u;
 constexpr u32 kSvc0 = 0xD4000001u;
 constexpr u32 kRetX5 = 0xD65F00A0u;
@@ -548,12 +549,25 @@ void TestFpControl(const fs::path& root) {
     pass("FADD honors guest FPCR rounding");
 }
 
+template <typename Read32>
+u64 FindGuestReturnStub(u64 mod_base, Read32&& read32, u64 scan_limit = 0x100000) {
+    u64 bare_ret = 0;
+    for (u64 off = 0; off < scan_limit; off += 4) {
+        const u32 insn = read32(mod_base + off);
+        if (insn == kRetX30) {
+            if (!bare_ret) {
+                bare_ret = mod_base + off;
+            }
+        } else if (insn == kMovX0Zero && read32(mod_base + off + 4) == kRetX30) {
+            return mod_base + off;
+        }
+    }
+    return bare_ret;
+}
+
 void TestUnresolvedImportPolicy() {
-    using suyu::recomp::FindGuestReturnStub;
     using suyu::recomp::FormatUnresolvedImportDiagnostic;
     using suyu::recomp::IsUnresolvedImportTrap;
-    using suyu::recomp::kA64MovX0Zero;
-    using suyu::recomp::kA64Ret;
     using suyu::recomp::kUnresolvedImportTrap;
     using suyu::recomp::TakeUnresolvedImportTrap;
     using suyu::recomp::UnresolvedImport;
@@ -563,7 +577,7 @@ void TestUnresolvedImportPolicy() {
 
     const u64 base = 0x7100000000ULL;
     std::vector<u32> text(16, 0xD503201Fu);
-    text[4] = kA64Ret;
+    text[4] = kRetX30;
     auto read32 = [&](u64 va) -> u32 {
         const u64 i = (va - base) / 4;
         return i < text.size() ? text[i] : 0;
@@ -579,8 +593,8 @@ void TestUnresolvedImportPolicy() {
         pass("unresolved JUMP_SLOT uses the halt sentinel");
     }
 
-    text[8] = kA64MovX0Zero;
-    text[9] = kA64Ret;
+    text[8] = kMovX0Zero;
+    text[9] = kRetX30;
     const u64 zero_ret = FindGuestReturnStub(base, read32, 64);
     if (zero_ret != base + 32) {
         fail("FindGuestReturnStub missed mov x0,#0; ret");

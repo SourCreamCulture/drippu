@@ -1,9 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-//
-// Shared unresolved-import policy for ArmRecomp and the exporter-smoke tests.
-// Slot targeting and trap handling live here so the dispatcher cannot silently
-// invent a different rule from the reloc writer.
 
 #pragma once
 
@@ -18,11 +14,6 @@ namespace suyu::recomp {
 using u32 = uint32_t;
 using u64 = uint64_t;
 
-constexpr u32 kA64MovX0Zero = 0xD2800000u;
-constexpr u32 kA64Ret = 0xD65F03C0u;
-
-// Recognizable PC the reloc writer stores in an unresolved GOT/IRELATIVE slot
-// so the dispatcher can tell a missing import from a real guest address.
 constexpr u64 kUnresolvedImportTrap = 0xFFFF'FFFF'0000'0000ULL;
 
 enum class UnresolvedReloc : u32 {
@@ -53,26 +44,6 @@ inline const char* UnresolvedRelocName(UnresolvedReloc kind) {
     return "R_AARCH64_UNKNOWN";
 }
 
-// Test helper. Locates a guest `mov x0, #0; ret` or a bare `ret` so tests can
-// prove reloc targeting does not reuse that instruction as an import.
-template <typename Read32>
-inline u64 FindGuestReturnStub(u64 mod_base, Read32&& read32, u64 scan_limit = 0x100000) {
-    u64 bare_ret = 0;
-    for (u64 off = 0; off < scan_limit; off += 4) {
-        const u32 insn = read32(mod_base + off);
-        if (insn == kA64Ret) {
-            if (!bare_ret) {
-                bare_ret = mod_base + off;
-            }
-        } else if (insn == kA64MovX0Zero && read32(mod_base + off + 4) == kA64Ret) {
-            return mod_base + off;
-        }
-    }
-    return bare_ret;
-}
-
-// Address written into an unresolved GOT/PLT slot or an IRELATIVE slot whose
-// resolver this backend cannot invoke. Never a guest RET.
 inline u64 UnresolvedSlotTarget() {
     return kUnresolvedImportTrap;
 }
@@ -143,4 +114,4 @@ inline UnresolvedTrapResult TakeUnresolvedImportTrap(u64 x0, u64 lr,
     return r;
 }
 
-} // namespace suyu::recomp
+}
