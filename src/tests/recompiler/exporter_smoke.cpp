@@ -573,7 +573,7 @@ void TestUnresolvedImportPolicy() {
         fail("FindGuestReturnStub missed the bare RET");
         return;
     }
-    if (UnresolvedSlotTarget(bare) != kUnresolvedImportTrap) {
+    if (UnresolvedSlotTarget() == bare) {
         fail("unresolved JUMP_SLOT still targets a guest RET stub");
     } else {
         pass("unresolved JUMP_SLOT uses the halt sentinel");
@@ -586,15 +586,15 @@ void TestUnresolvedImportPolicy() {
         fail("FindGuestReturnStub missed mov x0,#0; ret");
         return;
     }
-    if (UnresolvedSlotTarget(zero_ret) != kUnresolvedImportTrap) {
+    if (UnresolvedSlotTarget() == zero_ret) {
         fail("unsupported IRELATIVE still targets mov x0,#0; ret");
     } else {
         pass("unsupported IRELATIVE uses the halt sentinel");
     }
-    if (UnresolvedSlotTarget(0) != kUnresolvedImportTrap) {
-        fail("empty trap_va is not the halt sentinel");
+    if (UnresolvedSlotTarget() != kUnresolvedImportTrap) {
+        fail("UnresolvedSlotTarget is not the halt sentinel");
     } else {
-        pass("empty trap_va is the halt sentinel");
+        pass("UnresolvedSlotTarget is the halt sentinel");
     }
 
     const std::vector<UnresolvedImport> recorded{
@@ -604,6 +604,10 @@ void TestUnresolvedImportPolicy() {
     const auto hit = TakeUnresolvedImportTrap(0xDEADBEEFCAFEBABEULL, 0x7100001000ULL, recorded);
     if (hit.action != UnresolvedTrapAction::Halt) {
         fail("unresolved import trap still fakes a function return");
+    } else if (hit.x0 != 0xDEADBEEFCAFEBABEULL) {
+        fail("unresolved import trap changed X0");
+    } else if (hit.pc == 0x7100001000ULL) {
+        fail("unresolved import trap returned to LR");
     } else {
         pass("unresolved import trap halts");
     }

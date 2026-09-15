@@ -53,9 +53,8 @@ inline const char* UnresolvedRelocName(UnresolvedReloc kind) {
     return "R_AARCH64_UNKNOWN";
 }
 
-// Scan module text for `mov x0, #0; ret`, else a bare `ret`. Current reloc
-// writer prefers this guest VA over kUnresolvedImportTrap so Dynarmic can
-// execute a real instruction. That turns a missing import into a silent return.
+// Test helper. Locates a guest `mov x0, #0; ret` or a bare `ret` so tests can
+// prove reloc targeting does not reuse that instruction as an import.
 template <typename Read32>
 inline u64 FindGuestReturnStub(u64 mod_base, Read32&& read32, u64 scan_limit = 0x100000) {
     u64 bare_ret = 0;
@@ -72,10 +71,10 @@ inline u64 FindGuestReturnStub(u64 mod_base, Read32&& read32, u64 scan_limit = 0
     return bare_ret;
 }
 
-// Address written into an unresolved or unsupported-IRELATIVE slot.
-// trap_va is a FindGuestReturnStub result (0 if none).
-inline u64 UnresolvedSlotTarget(u64 trap_va) {
-    return trap_va ? trap_va : kUnresolvedImportTrap;
+// Address written into an unresolved GOT/PLT slot or an IRELATIVE slot whose
+// resolver this backend cannot invoke. Never a guest RET.
+inline u64 UnresolvedSlotTarget() {
+    return kUnresolvedImportTrap;
 }
 
 inline bool IsUnresolvedImportTrap(u64 pc) {
@@ -83,12 +82,11 @@ inline bool IsUnresolvedImportTrap(u64 pc) {
 }
 
 enum class UnresolvedTrapAction {
-    FakeReturnZero,
     Halt,
 };
 
 struct UnresolvedTrapResult {
-    UnresolvedTrapAction action = UnresolvedTrapAction::FakeReturnZero;
+    UnresolvedTrapAction action = UnresolvedTrapAction::Halt;
     u64 x0 = 0;
     u64 pc = 0;
     std::string diagnostic;
@@ -135,14 +133,12 @@ inline std::string FormatUnresolvedTrapDiagnostic(u64 lr,
     return out;
 }
 
-// Current dispatcher. Treats the sentinel as a successful empty function.
 inline UnresolvedTrapResult TakeUnresolvedImportTrap(u64 x0, u64 lr,
                                                      const std::vector<UnresolvedImport>& recorded) {
-    (void)x0;
     UnresolvedTrapResult r;
-    r.action = UnresolvedTrapAction::FakeReturnZero;
-    r.x0 = 0;
-    r.pc = lr;
+    r.action = UnresolvedTrapAction::Halt;
+    r.x0 = x0;
+    r.pc = kUnresolvedImportTrap;
     r.diagnostic = FormatUnresolvedTrapDiagnostic(lr, recorded);
     return r;
 }
