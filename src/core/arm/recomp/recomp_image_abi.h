@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 
 namespace suyu::recomp {
 
@@ -15,6 +17,12 @@ inline constexpr uint32_t kRecompMaxModules = 16;
 inline constexpr uint32_t kRecompBuildIdSize = 32;
 inline constexpr uint32_t kRecompModuleNameSize = 32;
 
+inline constexpr const char* kRecompLoadOrder[] = {
+    "rtld",    "main",    "subsdk0", "subsdk1", "subsdk2", "subsdk3",
+    "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
+    "sdk",
+};
+
 struct RecompImageAbi {
     uint32_t abi_version;
     uint32_t abi_size;
@@ -23,6 +31,11 @@ struct RecompImageAbi {
     uint32_t module_index;
     uint8_t build_id[kRecompBuildIdSize];
     char module_name[kRecompModuleNameSize];
+};
+
+struct RecompImageIdentity {
+    uint32_t module_index = 0;
+    uint8_t build_id[kRecompBuildIdSize]{};
 };
 
 using RecompImageBlockFn = void (*)(void*);
@@ -55,6 +68,7 @@ enum class ImageReject {
 };
 
 struct RecompModuleSlot {
+    RecompImageLookupFn lookup = nullptr;
     RecompImageSetBaseFn set_base = nullptr;
     uint64_t base = 0;
     const RecompImageAbi* abi = nullptr;
@@ -65,51 +79,174 @@ struct RecompModuleMap {
     uint32_t count = 0;
 };
 
-// Matches src/suyu/main.cpp LoadRecompiledImagesFrom and src/suyu_cmd/suyu.cpp
-// today: a lookup export is enough to accept the image. ABI version, context
-// size, content hash, and set_base are unresolved and not required.
+inline int ModuleIndexForName(std::string_view name) {
+    for (uint32_t i = 0; i < sizeof(kRecompLoadOrder) / sizeof(kRecompLoadOrder[0]); ++i) {
+        if (name == kRecompLoadOrder[i]) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+inline bool ParseBuildIdHex(std::string_view hex, uint8_t out[kRecompBuildIdSize]) {
+    if (hex.size() != kRecompBuildIdSize * 2) {
+        return false;
+    }
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        if (c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        return -1;
+    };
+    for (uint32_t i = 0; i < kRecompBuildIdSize; ++i) {
+        const int hi = nibble(hex[i * 2]);
+        const int lo = nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+inline bool ModuleNameEqual(const char* a, const char* b) {
+    if (!a || !b) {
+        return false;
+    }
+    while (*a && *b) {
+        const unsigned char ca = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(*a++)));
+        const unsigned char cb = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(*b++)));
+        if (ca != cb) {
+            return false;
+        }
+    }
+    return *a == *b;
+}
+
+inline const char* ImageRejectName(ImageReject r) {
+    switch (r) {
+    case ImageReject::Ok:
+        return "ok";
+    case ImageReject::MissingLookup:
+        return "missing recomp_image_lookup";
+    case ImageReject::MissingSetBase:
+        return "missing recomp_image_set_base";
+    case ImageReject::MissingAbi:
+        return "missing recomp_image_abi";
+    case ImageReject::AbiVersion:
+        return "ABI version mismatch";
+    case ImageReject::AbiSize:
+        return "ABI size mismatch";
+    case ImageReject::RegsPrefix:
+        return "GuestContext prefix size mismatch";
+    case ImageReject::EmptyName:
+        return "empty module name";
+    case ImageReject::BuildId:
+        return "content hash mismatch";
+    case ImageReject::DuplicateIndex:
+        return "duplicate module index";
+    case ImageReject::IndexRange:
+        return "module index out of range";
+    }
+    return "unknown";
+}
+
 inline ImageReject ValidateImageExports(const RecompImageExports& ex,
                                         const ImageExpect& expect = {}) {
-    (void)expect;
     if (!ex.lookup) {
         return ImageReject::MissingLookup;
+    }
+    if (!ex.set_base) {
+        return ImageReject::MissingSetBase;
+    }
+    if (!ex.abi) {
+        return ImageReject::MissingAbi;
+    }
+    const RecompImageAbi* abi = ex.abi();
+    if (!abi) {
+        return ImageReject::MissingAbi;
+    }
+    if (abi->abi_version != kRecompImageAbiVersion) {
+        return ImageReject::AbiVersion;
+    }
+    if (abi->abi_size != sizeof(RecompImageAbi)) {
+        return ImageReject::AbiSize;
+    }
+    if (abi->regs_prefix_size != kRecompRegsPrefixSize) {
+        return ImageReject::RegsPrefix;
+    }
+    if (abi->module_name[0] == '\0') {
+        return ImageReject::EmptyName;
+    }
+    if (expect.build_id &&
+        std::memcmp(abi->build_id, expect.build_id, kRecompBuildIdSize) != 0) {
+        return ImageReject::BuildId;
     }
     return ImageReject::Ok;
 }
 
-// Matches the suyu-cmd DLL path: missing files are skipped and survivors are
-// packed into a vector. Bases are then applied by that vector's index.
-inline ImageReject PlaceLoadedModule(RecompModuleMap& map, const RecompImageExports& ex) {
-    if (!ex.lookup) {
-        return ImageReject::MissingLookup;
+inline ImageReject PlaceLoadedModule(RecompModuleMap& map, const RecompImageExports& ex,
+                                     const ImageExpect& expect = {}) {
+    const ImageReject rejected = ValidateImageExports(ex, expect);
+    if (rejected != ImageReject::Ok) {
+        return rejected;
     }
-    if (map.count >= kRecompMaxModules) {
+    const RecompImageAbi* abi = ex.abi();
+    if (abi->module_index >= kRecompMaxModules) {
         return ImageReject::IndexRange;
     }
-    const RecompImageAbi* abi = ex.abi ? ex.abi() : nullptr;
-    map.slots[map.count++] = RecompModuleSlot{ex.set_base, 0, abi};
-    return ImageReject::Ok;
-}
-
-inline void ApplyModuleBase(RecompModuleMap& map, size_t index, const char* name, uint64_t base) {
-    (void)name;
-    if (index < map.count && map.slots[index].set_base) {
-        map.slots[index].base = base;
-        map.slots[index].set_base(base);
+    RecompModuleSlot& slot = map.slots[abi->module_index];
+    if (slot.lookup || slot.set_base || slot.abi) {
+        return ImageReject::DuplicateIndex;
     }
+    slot.lookup = ex.lookup;
+    slot.set_base = ex.set_base;
+    slot.abi = abi;
+    if (abi->module_index + 1 > map.count) {
+        map.count = abi->module_index + 1;
+    }
+    return ImageReject::Ok;
 }
 
 inline const RecompModuleSlot* SlotByName(const RecompModuleMap& map, const char* name) {
-    if (!name) {
+    if (!name || !name[0]) {
         return nullptr;
     }
-    for (uint32_t i = 0; i < map.count; ++i) {
+    const char* stripped = name;
+    if (std::strncmp(name, "nn", 2) == 0 || std::strncmp(name, "NN", 2) == 0) {
+        stripped = name + 2;
+    }
+    for (uint32_t i = 0; i < kRecompMaxModules; ++i) {
         const RecompImageAbi* abi = map.slots[i].abi;
-        if (abi && std::strncmp(abi->module_name, name, kRecompModuleNameSize) == 0) {
+        if (!abi) {
+            continue;
+        }
+        if (ModuleNameEqual(abi->module_name, name) || ModuleNameEqual(abi->module_name, stripped)) {
             return &map.slots[i];
         }
     }
     return nullptr;
+}
+
+inline void ApplyModuleBase(RecompModuleMap& map, size_t index, const char* name, uint64_t base) {
+    if (index < kRecompMaxModules && map.slots[index].set_base) {
+        map.slots[index].base = base;
+        map.slots[index].set_base(base);
+        return;
+    }
+    if (const RecompModuleSlot* found = SlotByName(map, name)) {
+        auto& slot = map.slots[static_cast<size_t>(found - map.slots)];
+        if (slot.set_base) {
+            slot.base = base;
+            slot.set_base(base);
+        }
+    }
 }
 
 } // namespace suyu::recomp
