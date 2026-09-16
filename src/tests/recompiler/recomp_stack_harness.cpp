@@ -931,11 +931,11 @@ int main() {
     ScenarioRestart(*fix);
     ScenarioStepMiss(*fix);
 
-    const fs::path json_path = [](const fs::path& root) {
+    const fs::path json_path = [](const fs::path& work) {
         if (const char* env = std::getenv("SUYU_RECOMP_EXECUTION_JSON"); env && env[0] != '\0') {
             return fs::path(env);
         }
-        return root / "recomp_execution.json";
+        return work / "recomp_execution.json";
     }(root);
     ExportExecutionJson(json_path);
     PrintGaps();
