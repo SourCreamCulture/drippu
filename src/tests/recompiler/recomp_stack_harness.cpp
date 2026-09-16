@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -844,6 +845,47 @@ void ScenarioStepMiss(StackFixture& f) {
     ScenarioPass("StepThread force-miss of registered AOT uses Dynarmic step", before);
 }
 
+void ExportExecutionJson(const fs::path& path) {
+    const int before = g_fails;
+    if (!Core::WriteRecompExecutionJson(path.string())) {
+        Fail("WriteRecompExecutionJson " + path.string());
+        return;
+    }
+    Pass("wrote " + path.string());
+
+    std::ifstream in(path);
+    std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ExpectTrue("JSON file not empty", !json.empty());
+    ExpectTrue("JSON schema_version 1", json.find("\"schema_version\": 1") != std::string::npos);
+    ExpectTrue("JSON kind recomp_execution", json.find("\"kind\": \"recomp_execution\"") != std::string::npos);
+    ExpectTrue("JSON clock steady_clock", json.find("\"clock\": \"steady_clock\"") != std::string::npos);
+    ExpectTrue("JSON backends.aot", json.find("\"aot\"") != std::string::npos);
+    ExpectTrue("JSON backends.dynarmic", json.find("\"dynarmic\"") != std::string::npos);
+    ExpectTrue("JSON fallback_reasons", json.find("\"fallback_reasons\"") != std::string::npos);
+    ExpectTrue("JSON icache", json.find("\"icache\"") != std::string::npos);
+
+    const auto m = Core::GetRecompExecutionMetrics();
+    ExpectEq("metrics schema", static_cast<u64>(Core::RecompExecutionMetrics::kSchemaVersion), 1);
+    ExpectTrue("AOT block_executions > 0", m.aot_block_executions > 0);
+    ExpectTrue("AOT time_ns > 0", m.aot_time_ns > 0);
+    ExpectTrue("Dynarmic run+step slices > 0",
+               (m.dynarmic_run_slices + m.dynarmic_step_slices) > 0);
+    ExpectTrue("Dynarmic time_ns > 0", m.dynarmic_time_ns > 0);
+    ExpectTrue("aot_to_dynarmic > 0", m.aot_to_dynarmic > 0);
+    ExpectTrue("fallback lookup_miss > 0", m.fallback_lookup_miss > 0);
+    ExpectTrue("fallback unhandled_opcode > 0", m.fallback_unhandled_opcode > 0);
+    ExpectTrue("fallback icache_rejected > 0", m.fallback_icache_rejected > 0);
+    ExpectTrue("ClearInstructionCache recorded", m.clear_instruction_cache_calls > 0);
+    ExpectTrue("InvalidateCacheRange recorded (not a permanent reject)",
+               m.invalidate_cache_range_calls > 0);
+    ExpectTrue("permanent AOT reject recorded", m.permanent_aot_reject_events > 0);
+
+    std::cout << "recomp_execution.json path: " << path << "\n";
+    std::cout << "also: " << Core::DefaultRecompExecutionJsonPath() << "\n";
+    std::cout << "=== recomp_execution.json ===\n" << json << std::endl;
+    ScenarioPass("AOT/JIT execution JSON from live ArmRecomp stack", before);
+}
+
 void PrintGaps() {
     std::cout
         << "GAPS (honest / out of scope):\n"
@@ -851,9 +893,11 @@ void PrintGaps() {
         << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
         << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
         << "  - gdbstub StepThread against a live title\n"
+        << "  - JIT vs hybrid AOT benchmarks (backlog #3) — JSON is the input, not the race\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
-        << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread.\n";
+        << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
+        << "  live AOT/Dynarmic timers + fallback reasons + icache JSON export.\n";
 }
 
 } // namespace
@@ -886,6 +930,14 @@ int main() {
     ScenarioInvalidation(*fix);
     ScenarioRestart(*fix);
     ScenarioStepMiss(*fix);
+
+    const fs::path json_path = [](const fs::path& root) {
+        if (const char* env = std::getenv("SUYU_RECOMP_EXECUTION_JSON"); env && env[0] != '\0') {
+            return fs::path(env);
+        }
+        return root / "recomp_execution.json";
+    }(root);
+    ExportExecutionJson(json_path);
     PrintGaps();
 
     if (g_fails == 0) {
