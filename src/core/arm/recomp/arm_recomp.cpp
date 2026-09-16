@@ -550,11 +550,15 @@ struct ArmRecomp::Impl {
                 // the loader's actual filename/base map for the application,
                 // otherwise most images never get a base (or share one).
                 Loader::AppLoader::Modules loaded_modules;
-                if (process == system.ApplicationProcess() &&
-                    system.GetAppLoader().ReadNSOModules(loaded_modules) ==
-                        Loader::ResultStatus::Success &&
-                    !loaded_modules.empty()) {
-                    modules = std::move(loaded_modules);
+                // TryGetAppLoader: no title is loaded in the stack harness.
+                if (process == system.ApplicationProcess()) {
+                    if (auto* loader = system.TryGetAppLoader();
+                        loader &&
+                        loader->ReadNSOModules(loaded_modules) ==
+                            Loader::ResultStatus::Success &&
+                        !loaded_modules.empty()) {
+                        modules = std::move(loaded_modules);
+                    }
                 }
                 g_counters.RecordModules(modules);
                 // Now that the loader has placed everything, tell each image
