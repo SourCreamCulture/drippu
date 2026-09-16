@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -80,6 +81,9 @@ RecompLookupFn GetRecompLookup();
 /// plus svc_calls, unresolved_import_traps, and histograms.
 /// Default path: $SUYU_RECOMP_EXECUTION_JSON, else `{LogDir}/recomp_execution.json`
 /// (Linux: ~/.local/share/suyu/log/recomp_execution.json unless portable `user/`).
+/// WriteRecompExecutionJson keeps `std::filesystem::path` (no narrow `.string()`
+/// ofstream) and publishes via dest+".tmp" then rename so a reader never sees a
+/// torn file; an existing dest is replaced (RenameFile refuses overwrite).
 struct RecompExecutionMetrics {
     static constexpr int kSchemaVersion = 1;
 
@@ -104,8 +108,8 @@ struct RecompExecutionMetrics {
 
 RecompExecutionMetrics GetRecompExecutionMetrics();
 std::string FormatRecompExecutionJson();
-std::string DefaultRecompExecutionJsonPath();
-bool WriteRecompExecutionJson(const std::string& path = {});
+std::filesystem::path DefaultRecompExecutionJsonPath();
+bool WriteRecompExecutionJson(const std::filesystem::path& path = {});
 
 /**
  * CPU backend that executes statically recompiled AArch64 rather than JITing

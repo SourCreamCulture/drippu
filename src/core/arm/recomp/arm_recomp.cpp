@@ -19,6 +19,7 @@
 
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
@@ -575,12 +576,11 @@ RecompExecutionMetrics GetRecompExecutionMetrics() {
     return m;
 }
 
-std::string DefaultRecompExecutionJsonPath() {
+std::filesystem::path DefaultRecompExecutionJsonPath() {
     if (const char* env = std::getenv("SUYU_RECOMP_EXECUTION_JSON"); env && env[0] != '\0') {
-        return std::string{env};
+        return std::filesystem::path{env};
     }
-    return (Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_execution.json")
-        .string();
+    return Common::FS::GetSuyuPath(Common::FS::SuyuPath::LogDir) / "recomp_execution.json";
 }
 
 std::string FormatRecompExecutionJson() {
@@ -651,18 +651,37 @@ std::string FormatRecompExecutionJson() {
     return doc.dump(2);
 }
 
-bool WriteRecompExecutionJson(const std::string& path) {
-    const std::string out_path = path.empty() ? DefaultRecompExecutionJsonPath() : path;
-    const std::filesystem::path fs_path{out_path};
-    if (!Common::FS::CreateParentDirs(fs_path)) {
+bool WriteRecompExecutionJson(const std::filesystem::path& path) {
+    const std::filesystem::path dest = path.empty() ? DefaultRecompExecutionJsonPath() : path;
+    if (!Common::FS::CreateParentDirs(dest)) {
         return false;
     }
-    std::ofstream out(out_path, std::ios::trunc);
-    if (!out) {
+    std::filesystem::path tmp = dest;
+    tmp += ".tmp";
+    {
+        std::ofstream out;
+        Common::FS::OpenFileStream(out, tmp, std::ios_base::out | std::ios_base::trunc);
+        if (!out) {
+            return false;
+        }
+        out << FormatRecompExecutionJson();
+        out.flush();
+        if (!out) {
+            out.close();
+            Common::FS::RemoveFile(tmp);
+            return false;
+        }
+    }
+    // RenameFile refuses an existing dest; drop the previous snapshot first.
+    if (!Common::FS::RemoveFile(dest)) {
+        Common::FS::RemoveFile(tmp);
         return false;
     }
-    out << FormatRecompExecutionJson();
-    return static_cast<bool>(out);
+    if (!Common::FS::RenameFile(tmp, dest)) {
+        Common::FS::RemoveFile(tmp);
+        return false;
+    }
+    return true;
 }
 
 struct ArmRecomp::Impl {
@@ -1604,6 +1623,12 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     if (impl->ConsumeUnresolvedImportTrap()) {
         return HaltReason::PrefetchAbort;
     }
+    // Same resume contract as RunThread: leftover pending_svc is from a prior
+    // halt the kernel already serviced. A debugger step of a non-SVC AOT block
+    // must not report SupervisorCall because that field was still set.
+    if (impl->ctx.pending_svc != kNoPendingSvc) {
+        impl->ctx.pending_svc = kNoPendingSvc;
+    }
     if (impl->in_fallback) {
         if (impl->LookupAot(impl->ctx.pc) == AotLookup::Hit) {
             impl->in_fallback = false;
@@ -1632,6 +1657,7 @@ HaltReason ArmRecomp::StepThread(Kernel::KThread* thread) {
     // Do not honour a leftover chain budget from RunThread: a debugger step
     // must not race through a direct-call chain.
     impl->ctx.chain_budget = 0;
+    g_counters.static_blocks.fetch_add(1, std::memory_order_relaxed);
     {
         ScopedNs timer{g_counters.aot_time_ns};
         block(&impl->ctx);

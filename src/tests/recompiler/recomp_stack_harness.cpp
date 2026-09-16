@@ -143,6 +143,7 @@ constexpr u64 kOffMissPark = 0x1008;
 // AOT proof: Translate MOVZ #7 / SVC #1, but guest RX is BEEF/99 (Dynarmic twin differs).
 constexpr u64 kOffAotProof = 0x1400;
 constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
+constexpr u64 kOffStepNoSvc = 0x1C00; // MOVZ #7 only — leftover pending_svc pin
 constexpr u64 kOffCrossPage = 0x1FFC;
 constexpr u64 kCodeBytes = 3 * Kernel::PageSize;
 constexpr u64 kImageBytes = 4 * Kernel::PageSize;
@@ -177,6 +178,7 @@ BlockFn g_block_miss = nullptr;
 BlockFn g_block_miss_park = nullptr;
 BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
+BlockFn g_block_step_no_svc = nullptr;
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
 
@@ -214,6 +216,9 @@ Core::RecompBlockFn Lookup(u64 pc) {
     if (pc == g_entry + kOffPlain) {
         return g_block_plain;
     }
+    if (pc == g_entry + kOffStepNoSvc) {
+        return g_block_step_no_svc;
+    }
     return nullptr;
 }
 
@@ -236,6 +241,7 @@ std::string BuildAotSource() {
     const std::string t_proof_svc = TranslateInsn(kSvc1, kOffAotProof + 4);
     const std::string t_mov7 = TranslateInsn(kMovzX0_7, kOffPlain);
     const std::string t_svc1 = TranslateInsn(kSvc1, kOffPlain + 4);
+    const std::string t_step_mov7 = TranslateInsn(kMovzX0_7, kOffStepNoSvc);
 
     std::ostringstream src;
     src << R"C(#include <stdint.h>
@@ -321,6 +327,13 @@ void block_plain(GuestContext* c) {
 )C";
     src << t_mov7 << t_svc1;
     src << R"C(}
+
+void block_step_no_svc(GuestContext* c) {
+)C";
+    src << t_step_mov7;
+    src << "    c->pc = g_module_base + 0x" << std::hex << (kOffStepNoSvc + 4) << std::dec
+        << "ULL;\n";
+    src << R"C(}
 )C";
     return src.str();
 }
@@ -395,14 +408,16 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_miss_park = reinterpret_cast<BlockFn>(dlsym(g_so, "block_miss_park"));
     g_block_aot_proof = reinterpret_cast<BlockFn>(dlsym(g_so, "block_aot_proof"));
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
+    g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
     ExpectTrue("dlsym recomp_set_module_base", g_set_base != nullptr);
     ExpectTrue("dlsym block_tls_svc", g_block_tls != nullptr);
     ExpectTrue("dlsym block_unhandled", g_block_unhandled != nullptr);
     ExpectTrue("dlsym block_miss", g_block_miss != nullptr);
     ExpectTrue("dlsym block_aot_proof", g_block_aot_proof != nullptr);
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
+    ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
-           g_block_plain;
+           g_block_plain && g_block_step_no_svc;
 #endif
 }
 
@@ -432,6 +447,7 @@ void WriteGuestImage(std::vector<u8>& image) {
     // Plain / icache site (guest RX matches Translate).
     put(kOffPlain, kMovzX0_7);
     put(kOffPlain + 4, kSvc1);
+    put(kOffStepNoSvc, kMovzX0_7);
 }
 
 struct StackFixture {
@@ -696,6 +712,30 @@ void ScenarioSvcTlsCrossPage(StackFixture& f) {
     ScenarioPass("Translate AOT SVC/TLS/cross-page via ApplicationMemory", before);
 }
 
+void ScenarioLeftoverSvcStep(StackFixture& f) {
+    const int before = g_fails;
+    // ScenarioSvcTlsCrossPage left pending_svc=42. LoadContext does not clear it.
+    ExpectEq("leftover svc still parked", f.arm->GetSvcNumber(), 42);
+
+    auto& ctx = f.thread->GetContext();
+    ctx = {};
+    ctx.pc = g_entry + kOffStepNoSvc;
+    f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+
+    const auto hr = f.arm->StepThread(f.thread);
+    ExpectTrue("leftover-svc step is StepThread, not SupervisorCall",
+               True(hr & Core::HaltReason::StepThread));
+    ExpectTrue("leftover-svc step is not SupervisorCall",
+               !True(hr & Core::HaltReason::SupervisorCall));
+    ExpectEq("leftover svc cleared (not this step)", f.arm->GetSvcNumber(),
+             static_cast<u32>(~0u));
+    Kernel::Svc::ThreadContext out{};
+    f.arm->GetContext(out);
+    ExpectEq("leftover-svc step x0", out.r[0], 7);
+    ExpectEq("leftover-svc step pc", out.pc, g_entry + kOffStepNoSvc + 4);
+    ScenarioPass("StepThread clears leftover pending_svc before a non-SVC AOT block", before);
+}
+
 void ScenarioLoadContextTls(StackFixture& f) {
     const int before = g_fails;
     auto& core0 = f.system.Kernel().PhysicalCore(0);
@@ -847,13 +887,14 @@ void ScenarioStepMiss(StackFixture& f) {
 
 void ExportExecutionJson(const fs::path& path) {
     const int before = g_fails;
-    if (!Core::WriteRecompExecutionJson(path.string())) {
+    if (!Core::WriteRecompExecutionJson(path)) {
         Fail("WriteRecompExecutionJson " + path.string());
         return;
     }
     Pass("wrote " + path.string());
-    const std::string def = Core::DefaultRecompExecutionJsonPath();
-    if (def != path.string()) {
+    ExpectTrue("JSON overwrite via tmp+rename", Core::WriteRecompExecutionJson(path));
+    const fs::path def = Core::DefaultRecompExecutionJsonPath();
+    if (def != path) {
         ExpectTrue("also wrote default LogDir JSON", Core::WriteRecompExecutionJson({}));
     }
 
@@ -901,7 +942,8 @@ void PrintGaps() {
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
-        << "  live AOT/Dynarmic timers + fallback reasons + icache JSON export.\n";
+        << "  leftover pending_svc cleared on StepThread, live AOT/Dynarmic timers +\n"
+        << "  fallback reasons + icache JSON export (path-safe tmp+rename).\n";
 }
 
 } // namespace
@@ -926,6 +968,7 @@ int main() {
 
     ScenarioAotLiveProof(*fix); // before Clear: proves Lookup + AOT != Dynarmic twin
     ScenarioSvcTlsCrossPage(*fix);
+    ScenarioLeftoverSvcStep(*fix);
     ScenarioLoadContextTls(*fix);
     // Force-miss + unhandled need AllowsAot (registered Translate blocks).
     ScenarioForceMissRegistered(*fix);
