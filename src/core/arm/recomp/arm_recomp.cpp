@@ -19,6 +19,7 @@
 
 #include "common/logging/log.h"
 #include "common/string_util.h"
+#include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "core/arm/recomp/arm_recomp.h"
 #include "core/arm/recomp/recomp_icache.h"
@@ -652,6 +653,10 @@ std::string FormatRecompExecutionJson() {
 
 bool WriteRecompExecutionJson(const std::string& path) {
     const std::string out_path = path.empty() ? DefaultRecompExecutionJsonPath() : path;
+    const std::filesystem::path fs_path{out_path};
+    if (!Common::FS::CreateParentDirs(fs_path)) {
+        return false;
+    }
     std::ofstream out(out_path, std::ios::trunc);
     if (!out) {
         return false;

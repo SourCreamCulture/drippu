@@ -852,6 +852,10 @@ void ExportExecutionJson(const fs::path& path) {
         return;
     }
     Pass("wrote " + path.string());
+    const std::string def = Core::DefaultRecompExecutionJsonPath();
+    if (def != path.string()) {
+        ExpectTrue("also wrote default LogDir JSON", Core::WriteRecompExecutionJson({}));
+    }
 
     std::ifstream in(path);
     std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
