@@ -133,4 +133,9 @@ inline const char* UpdateBakeRefusal(UpdateBakeDecision decision) {
     }
 }
 
+/// True when PatchManager returned a different handle than the base input.
+inline bool PatchHandleReplaced(bool update_present, bool has_patched, bool same_as_base) {
+    return update_present && has_patched && !same_as_base;
+}
+
 } // namespace FileSys

@@ -94,6 +94,10 @@ TEST_CASE("DecideUpdateBake fails closed without Program NCA or incomplete BKTR"
     REQUIRE(DecideUpdateBake(true, true, true, true) == UpdateBakeDecision::Applied);
     REQUIRE(UpdateBakeRefusal(UpdateBakeDecision::Applied) == nullptr);
 
+    REQUIRE_FALSE(FileSys::PatchHandleReplaced(true, true, true));
+    REQUIRE(FileSys::PatchHandleReplaced(true, true, false));
+    REQUIRE_FALSE(FileSys::PatchHandleReplaced(false, true, false));
+
     const auto mixed = FileSys::FilterAppliedBakeItems(
         {{FileSys::ExportBakeItem::Kind::Update, "Update v1.0.0", "NAND"}}, false, 0);
     REQUIRE(mixed.empty());

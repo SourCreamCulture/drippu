@@ -174,36 +174,23 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
 
     update_exefs_applied = false;
     if (base_exefs) {
-        // PatchExeFS(nullptr) is a no-op; a directory ROM's ExeFS must be
-        // passed in so an update NCA can replace it.
         patched_exefs = pm.PatchExeFS(base_exefs);
-        update_exefs_applied = update_exefs != nullptr && patched_exefs != nullptr &&
-                               patched_exefs->GetFile("main") != nullptr;
     } else if (update_exefs && update_exefs->GetFile("main")) {
         patched_exefs = update_exefs;
-        update_exefs_applied = true;
     } else {
         patched_exefs = nullptr;
     }
 
     const bool update_present = overlay->HasEntry(update_tid, ContentRecordType::Program);
+    // Honest ExeFS replace: PatchExeFS actually returned a different dir, or we
+    // substituted the update ExeFS because there was no base.
+    update_exefs_applied =
+        PatchHandleReplaced(update_present, patched_exefs != nullptr, patched_exefs == base_exefs);
+
     update_romfs_applied = false;
-    held_bktr_nca.reset();
     if (base_program_nca) {
-        if (auto update_raw = overlay->GetEntryRaw(update_tid, ContentRecordType::Program)) {
-            held_bktr_nca = std::make_shared<NCA>(update_raw, base_program_nca.get());
-            if (held_bktr_nca->GetStatus() == Loader::ResultStatus::Success &&
-                held_bktr_nca->GetRomFS()) {
-                update_romfs_applied = true;
-            } else {
-                held_bktr_nca.reset();
-            }
-        }
         patched_romfs =
             pm.PatchRomFS(base_program_nca.get(), base_romfs, ContentRecordType::Program);
-        if (!patched_romfs && held_bktr_nca) {
-            patched_romfs = held_bktr_nca->GetRomFS();
-        }
     } else {
         // Directory dump: no Program NCA means PatchRomFS cannot BKTR.
         patched_romfs = base_romfs;
@@ -211,6 +198,9 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
     if (!patched_romfs) {
         patched_romfs = base_romfs;
     }
+    // Honest RomFS replace: PatchRomFS output is not the same object as the base.
+    update_romfs_applied =
+        PatchHandleReplaced(update_present, patched_romfs != nullptr, patched_romfs == base_romfs);
 
     aoc.clear();
     for (const auto& entry :
@@ -259,11 +249,7 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
                                            update_exefs_applied, update_romfs_applied);
     if (const char* refusal = UpdateBakeRefusal(decision)) {
         error = refusal;
-        status = FormatExportBakeStatus(bake_items);
-        if (!status.empty()) {
-            status += ' ';
-        }
-        status += error;
+        status = error;
         return false;
     }
     bake_items = FilterAppliedBakeItems(candidates, decision == UpdateBakeDecision::Applied,
@@ -281,7 +267,6 @@ bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequ
     patched_romfs = nullptr;
     base_program_nca.reset();
     held_update_nca.reset();
-    held_bktr_nca.reset();
     held_aoc_ncas.clear();
     directory_exefs = nullptr;
     directory_romfs = nullptr;

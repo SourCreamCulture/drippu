@@ -1370,6 +1370,10 @@ void TestExportAddonClassification() {
     } else if (FileSys::DecideUpdateBake(true, true, true, true) !=
                FileSys::UpdateBakeDecision::Applied) {
         fail("full ExeFS+RomFS apply should be Applied");
+    } else if (FileSys::PatchHandleReplaced(true, true, true)) {
+        fail("same PatchManager handle must not count as replace");
+    } else if (!FileSys::PatchHandleReplaced(true, true, false)) {
+        fail("different PatchManager handle should count as replace");
     } else {
         pass("DecideUpdateBake fails closed without Program NCA");
     }

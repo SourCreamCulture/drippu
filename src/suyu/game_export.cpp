@@ -1458,43 +1458,6 @@ static bool CopyStagedContent(const QString& staged_dir, const QString& dest_par
     return true;
 }
 
-// Extract the romfs VirtualFile from a ROM (NSP/XCI/NCA). Returns nullptr if not available.
-static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path) {
-    // RealVfsFile holds a raw RealVfsFilesystem& (not a shared_ptr), so a
-    // locally-scoped vfs would dangle once files it opened outlive this
-    // function - keep one filesystem instance alive for the process.
-    static const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
-    auto file = vfs->OpenFile(rom_path, FileSys::OpenMode::Read);
-    if (!file) return nullptr;
-    const std::string name = file->GetName();
-    auto pos = name.rfind('.'); std::string ext;
-    if (pos != std::string::npos) { ext = name.substr(pos); std::transform(ext.begin(),ext.end(),ext.begin(),::tolower); }
-
-    const auto romfs_from_nsp = [](const std::shared_ptr<FileSys::NSP>& nsp) -> FileSys::VirtualFile {
-        if (nsp->GetStatus() != Loader::ResultStatus::Success) return nullptr;
-        const auto nca = nsp->GetNCA(nsp->GetProgramTitleID(), FileSys::ContentRecordType::Program);
-        return nca ? nca->GetRomFS() : nullptr;
-    };
-
-    if (ext == ".nsp") {
-        auto nsp = std::make_shared<FileSys::NSP>(file);
-        if (auto r = romfs_from_nsp(nsp)) return r;
-    }
-    if (ext == ".xci") {
-        auto xci = std::make_shared<FileSys::XCI>(file);
-        if (xci->GetStatus() == Loader::ResultStatus::Success) {
-            auto sec = xci->GetSecurePartitionNSP();
-            if (sec) if (auto r = romfs_from_nsp(sec)) return r;
-        }
-    }
-    if (ext == ".nca") {
-        auto nca = std::make_shared<FileSys::NCA>(file);
-        if (nca->GetStatus() == Loader::ResultStatus::Success)
-            return nca->GetRomFS();
-    }
-    return nullptr;
-}
-
 static bool FillMissingExeFsFromRom(const QString& dest_parent, const QString& rom_path) {
     const QString dest = dest_parent + QDir::separator() + QStringLiteral("exefs");
     if (ExeFsDirHasMain(dest)) {
