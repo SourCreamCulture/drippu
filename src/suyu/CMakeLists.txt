@@ -603,3 +603,28 @@ if (SUYU_USE_PRECOMPILED_HEADERS)
 endif()
 
 create_target_directory_groups(suyu)
+
+if (APPLE)
+    # PR CI smoke: live Qt GetWindowSystemInfo + MoltenVK metal surface.
+    add_executable(macos_moltenvk_smoke
+        macos_moltenvk_smoke.cpp
+        qt_common.cpp
+        qt_common.h
+    )
+    find_library(QUARTZCORE_LIBRARY QuartzCore REQUIRED)
+    target_link_libraries(macos_moltenvk_smoke PRIVATE
+        common
+        video_core
+        Qt${QT_MAJOR_VERSION}::Gui
+        Vulkan::Headers
+        ${PLATFORM_LIBRARIES}
+        ${QUARTZCORE_LIBRARY}
+    )
+    target_include_directories(macos_moltenvk_smoke PRIVATE
+        ${Qt${QT_MAJOR_VERSION}Gui_PRIVATE_INCLUDE_DIRS}
+    )
+    target_compile_definitions(macos_moltenvk_smoke PRIVATE
+        QT_NO_CAST_FROM_ASCII
+        QT_NO_CAST_TO_ASCII
+    )
+endif()

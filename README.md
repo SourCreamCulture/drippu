@@ -114,11 +114,17 @@ Binaries land in `build-macos/bin`: `suyu.app` and `suyu-cmd`. Release packaging
 copies the Qt bundle to `drippu.app`.
 
 MoltenVK comes from the bundled CPM package (`V380-Ori/Ryujinx.MoltenVK`,
-`v1.4.1-ryujinx`), is copied into `suyu.app/Contents/Frameworks/`, and is the
-copy that gets loaded: `Vulkan::OpenLibrary` tries the bundle's
-`libvulkan.1.dylib` and `libMoltenVK.dylib` before anything on the loader's
-search path. The app therefore does not need MoltenVK installed. Pass
-`-DYUZU_USE_BUNDLED_MOLTENVK=OFF` to prefer an installed MoltenVK instead.
+`v1.4.1-ryujinx`) by default (`YUZU_USE_BUNDLED_MOLTENVK=ON` on Apple). It is
+copied into `suyu.app/Contents/Frameworks/`, and that is the copy
+`Vulkan::OpenLibrary` loads: it tries `LIBVULKAN_PATH`, then the bundle's
+`libvulkan.1.dylib` and `libMoltenVK.dylib`. The app therefore does not need
+MoltenVK installed. Pass `-DYUZU_USE_BUNDLED_MOLTENVK=OFF` to prefer an
+installed copy (Homebrew `molten-vk`); GitHub Actions `release.yml` `build-macos`
+and the PR `macos-moltenvk-smoke` job use that so they can `brew install molten-vk`.
+
+`suyu-cmd` / `drippu-cmd` sit next to the bundle, not inside it, so they do not
+see `Contents/Frameworks` unless you export `LIBVULKAN_PATH` to a
+`libMoltenVK.dylib` (the one inside `suyu.app` or Homebrew's).
 
 macOS does not have NCE support yet. `HAS_NCE` is enabled for Android and Linux
 arm64 only, so the CPU runs on dynarmic's arm64 backend, whose Mach
