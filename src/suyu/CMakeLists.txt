@@ -606,6 +606,8 @@ create_target_directory_groups(suyu)
 
 if (APPLE)
     # PR CI smoke: live Qt VulkanRenderWidget WSI + MoltenVK device/swapchain.
+    # frontend_common supplies PlayTimeManager referenced from core's NS services
+    # (same as suyu-cmd / recomp_stack_harness).
     add_executable(macos_moltenvk_smoke
         macos_moltenvk_smoke.cpp
         qt_common.cpp
@@ -615,6 +617,7 @@ if (APPLE)
     target_link_libraries(macos_moltenvk_smoke PRIVATE
         common
         video_core
+        frontend_common
         Qt${QT_MAJOR_VERSION}::Widgets
         Vulkan::Headers
         ${PLATFORM_LIBRARIES}
