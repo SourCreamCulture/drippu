@@ -1360,6 +1360,19 @@ void TestExportAddonClassification() {
     } else {
         pass("AOC Count/List share GetBaseTitleID including update NPDM");
     }
+
+    if (FileSys::DecideUpdateBake(true, false, true, false) !=
+        FileSys::UpdateBakeDecision::MissingBaseProgramNca) {
+        fail("directory dump without Program NCA must refuse update bake");
+    } else if (FileSys::UpdateBakeRefusal(FileSys::UpdateBakeDecision::MissingBaseProgramNca) ==
+               nullptr) {
+        fail("missing Program NCA needs a refusal message");
+    } else if (FileSys::DecideUpdateBake(true, true, true, true) !=
+               FileSys::UpdateBakeDecision::Applied) {
+        fail("full ExeFS+RomFS apply should be Applied");
+    } else {
+        pass("DecideUpdateBake fails closed without Program NCA");
+    }
 }
 
 void DummyBlock(void* c) {

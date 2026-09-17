@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <memory>
 #include <fmt/format.h>
 
 #include "core/core.h"
@@ -185,8 +186,28 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
         patched_exefs = nullptr;
     }
 
-    patched_romfs =
-        pm.PatchRomFS(base_program_nca.get(), base_romfs, ContentRecordType::Program);
+    const bool update_present = overlay->HasEntry(update_tid, ContentRecordType::Program);
+    update_romfs_applied = false;
+    held_bktr_nca.reset();
+    if (base_program_nca) {
+        if (auto update_raw = overlay->GetEntryRaw(update_tid, ContentRecordType::Program)) {
+            held_bktr_nca = std::make_shared<NCA>(update_raw, base_program_nca.get());
+            if (held_bktr_nca->GetStatus() == Loader::ResultStatus::Success &&
+                held_bktr_nca->GetRomFS()) {
+                update_romfs_applied = true;
+            } else {
+                held_bktr_nca.reset();
+            }
+        }
+        patched_romfs =
+            pm.PatchRomFS(base_program_nca.get(), base_romfs, ContentRecordType::Program);
+        if (!patched_romfs && held_bktr_nca) {
+            patched_romfs = held_bktr_nca->GetRomFS();
+        }
+    } else {
+        // Directory dump: no Program NCA means PatchRomFS cannot BKTR.
+        patched_romfs = base_romfs;
+    }
     if (!patched_romfs) {
         patched_romfs = base_romfs;
     }
@@ -233,7 +254,20 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
             candidates.push_back(std::move(item));
         }
     }
-    bake_items = FilterAppliedBakeItems(candidates, update_exefs_applied, aoc.size());
+    bake_items = FilterAppliedBakeItems(candidates, false, aoc.size());
+    const auto decision = DecideUpdateBake(update_present, base_program_nca != nullptr,
+                                           update_exefs_applied, update_romfs_applied);
+    if (const char* refusal = UpdateBakeRefusal(decision)) {
+        error = refusal;
+        status = FormatExportBakeStatus(bake_items);
+        if (!status.empty()) {
+            status += ' ';
+        }
+        status += error;
+        return false;
+    }
+    bake_items = FilterAppliedBakeItems(candidates, decision == UpdateBakeDecision::Applied,
+                                        aoc.size());
     status = FormatExportBakeStatus(bake_items);
     return true;
 }
@@ -247,10 +281,12 @@ bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequ
     patched_romfs = nullptr;
     base_program_nca.reset();
     held_update_nca.reset();
+    held_bktr_nca.reset();
     held_aoc_ncas.clear();
     directory_exefs = nullptr;
     directory_romfs = nullptr;
     update_exefs_applied = false;
+    update_romfs_applied = false;
     title_id = request.title_id;
     status.clear();
 

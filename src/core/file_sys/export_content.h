@@ -75,6 +75,9 @@ public:
     [[nodiscard]] bool UpdateExeFSApplied() const {
         return update_exefs_applied;
     }
+    [[nodiscard]] bool UpdateRomFSApplied() const {
+        return update_romfs_applied;
+    }
 
 private:
     bool RegisterPath(const std::string& path, bool is_base_rom);
@@ -86,12 +89,14 @@ private:
     std::unique_ptr<class ContentProviderUnion> overlay;
     std::unique_ptr<NCA> base_program_nca;
     std::unique_ptr<NCA> held_update_nca;
+    std::shared_ptr<NCA> held_bktr_nca;
     std::vector<std::unique_ptr<NCA>> held_aoc_ncas;
     VirtualDir directory_exefs;
     VirtualFile directory_romfs;
 
     u64 title_id{};
     bool update_exefs_applied{false};
+    bool update_romfs_applied{false};
     VirtualDir patched_exefs;
     VirtualFile patched_romfs;
     std::vector<ExportBakeItem> bake_items;

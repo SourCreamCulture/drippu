@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -71,10 +72,6 @@
 // ---------------------------------------------------------------------------
 
 static bool CopyDirectoryRecursive(const QString& src, const QString& dst);
-static FileSys::VirtualDir ExtractExeFsFromRom(const std::string& rom_path);
-static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path);
-static qint64 DumpVirtualDir(const FileSys::VirtualDir& vdir, const QString& dest_dir);
-static bool DumpVirtualFile(const FileSys::VirtualFile& vf, const QString& dest_path);
 
 #ifdef _WIN32
 // RT_ICON resources contain a DIB, not a PNG file. Build a 32-bit,
@@ -1372,68 +1369,40 @@ static bool VirtualDirHasMain(const FileSys::VirtualDir& vdir) {
     return vdir && vdir->GetFile("main") != nullptr;
 }
 
-static bool FillMissingExeFsFromRom(const QString& dest_parent, const QString& rom_path) {
-    const QString dest = dest_parent + QDir::separator() + QStringLiteral("exefs");
-    if (ExeFsDirHasMain(dest)) {
-        return true;
-    }
-    if (rom_path.isEmpty() || !QFile::exists(rom_path)) {
-        return false;
-    }
-    const QFileInfo rom_info(rom_path);
-    if (rom_info.isDir()) {
-        QString src;
-        if (QFile::exists(rom_path + QDir::separator() + QStringLiteral("exefs") +
-                          QDir::separator() + QStringLiteral("main"))) {
-            src = rom_path + QDir::separator() + QStringLiteral("exefs");
-        } else if (QFile::exists(rom_path + QDir::separator() + QStringLiteral("main"))) {
-            src = rom_path;
-        }
-        if (src.isEmpty()) {
-            return false;
-        }
-        return CopyDirectoryRecursive(src, dest) && ExeFsDirHasMain(dest);
-    }
-    auto vdir = ExtractExeFsFromRom(rom_path.toStdString());
-    if (!vdir) {
-        return false;
-    }
-    if (DumpVirtualDir(vdir, dest) < 0) {
-        return false;
-    }
-    if (!QFile::exists(dest + QDir::separator() + QStringLiteral("romfs.bin"))) {
-        if (auto romfs = ExtractRomFsFromRom(rom_path.toStdString())) {
-            DumpVirtualFile(romfs, dest + QDir::separator() + QStringLiteral("romfs.bin"));
-        }
-    }
-    return ExeFsDirHasMain(dest);
+static bool StagedAocPresent(const QString& staged_dir) {
+    const QString aoc_dir = staged_dir + QDir::separator() + QStringLiteral("aoc");
+    return QDir(aoc_dir).exists() &&
+           !QDir(aoc_dir).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty();
 }
 
-static bool EnsurePackagedExeFs(const QString& dest_parent, const QString& rom_path) {
-    FillMissingExeFsFromRom(dest_parent, rom_path);
-    const QString aoc_dir = dest_parent + QDir::separator() + QStringLiteral("aoc");
-    if (QDir(aoc_dir).exists() &&
-        !QDir(aoc_dir).entryList(QDir::Dirs | QDir::NoDotAndDotDot).isEmpty() &&
-        !ExeFsDirHasMain(dest_parent + QDir::separator() + QStringLiteral("exefs"))) {
-        LOG_ERROR(Frontend, "Refusing to package DLC without exefs/main");
-        return false;
+static void PlaceParkedRomFS(const QString& staged_dir) {
+    const QString parked = staged_dir + QDir::separator() + QStringLiteral("romfs.bin");
+    const QString exefs = staged_dir + QDir::separator() + QStringLiteral("exefs");
+    if (!QFile::exists(parked) || !ExeFsDirHasMain(exefs)) {
+        return;
     }
-    return true;
+    const QString dest = exefs + QDir::separator() + QStringLiteral("romfs.bin");
+    QFile::remove(dest);
+    QFile::rename(parked, dest);
 }
 
 static bool StagePatchedContent(const FileSys::ExportContentSession& session,
                                 const QString& staged_dir) {
     const QString exefs_dst = staged_dir + QDir::separator() + QStringLiteral("exefs");
-    // Do not mkpath an empty exefs/: an empty directory blocks the Windows
-    // extract fallback (exists() is true) and can ship AOC with no main.
+    // Do not create exefs/ without main: an empty/partial directory blocks
+    // extract fallback and can ship AOC with no baked executable.
+    bool wrote_main = false;
     if (VirtualDirHasMain(session.GetPatchedExeFS())) {
         if (DumpVirtualDir(session.GetPatchedExeFS(), exefs_dst) < 0) {
             return false;
         }
+        wrote_main = true;
     }
     if (session.GetPatchedRomFS()) {
-        if (!DumpVirtualFile(session.GetPatchedRomFS(),
-                             exefs_dst + QDir::separator() + QStringLiteral("romfs.bin"))) {
+        const QString romfs_dest =
+            wrote_main ? (exefs_dst + QDir::separator() + QStringLiteral("romfs.bin"))
+                       : (staged_dir + QDir::separator() + QStringLiteral("romfs.bin"));
+        if (!DumpVirtualFile(session.GetPatchedRomFS(), romfs_dest)) {
             return false;
         }
     }
@@ -1481,6 +1450,11 @@ static bool CopyStagedContent(const QString& staged_dir, const QString& dest_par
         CopyFileReplacingExisting(baked, dest_parent + QDir::separator() +
                                              QStringLiteral("content_baked.txt"));
     }
+    const QString parked_romfs = staged_dir + QDir::separator() + QStringLiteral("romfs.bin");
+    if (QFile::exists(parked_romfs)) {
+        CopyFileReplacingExisting(parked_romfs, dest_parent + QDir::separator() +
+                                                    QStringLiteral("romfs.bin"));
+    }
     return true;
 }
 
@@ -1519,6 +1493,63 @@ static FileSys::VirtualFile ExtractRomFsFromRom(const std::string& rom_path) {
             return nca->GetRomFS();
     }
     return nullptr;
+}
+
+static bool FillMissingExeFsFromRom(const QString& dest_parent, const QString& rom_path) {
+    const QString dest = dest_parent + QDir::separator() + QStringLiteral("exefs");
+    if (ExeFsDirHasMain(dest)) {
+        return true;
+    }
+    if (rom_path.isEmpty() || !QFile::exists(rom_path)) {
+        return false;
+    }
+    const QFileInfo rom_info(rom_path);
+    if (rom_info.isDir()) {
+        QString src;
+        if (QFile::exists(rom_path + QDir::separator() + QStringLiteral("exefs") +
+                          QDir::separator() + QStringLiteral("main"))) {
+            src = rom_path + QDir::separator() + QStringLiteral("exefs");
+        } else if (QFile::exists(rom_path + QDir::separator() + QStringLiteral("main"))) {
+            src = rom_path;
+        }
+        if (src.isEmpty()) {
+            return false;
+        }
+        return CopyDirectoryRecursive(src, dest) && ExeFsDirHasMain(dest);
+    }
+    auto vdir = ExtractExeFsFromRom(rom_path.toStdString());
+    if (!vdir) {
+        return false;
+    }
+    if (DumpVirtualDir(vdir, dest) < 0) {
+        return false;
+    }
+    return ExeFsDirHasMain(dest);
+}
+
+static bool EnsurePackagedExeFs(const QString& dest_parent, const QString& rom_path) {
+    const QString exefs = dest_parent + QDir::separator() + QStringLiteral("exefs");
+    const bool has_aoc = StagedAocPresent(dest_parent);
+    if (has_aoc && !ExeFsDirHasMain(exefs)) {
+        LOG_ERROR(Frontend, "Refusing to package DLC without baked exefs/main");
+        return false;
+    }
+    if (!ExeFsDirHasMain(exefs)) {
+        const bool partial =
+            QDir(exefs).exists() &&
+            !QDir(exefs).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty();
+        if (!FillMissingExeFsFromRom(dest_parent, rom_path)) {
+            if (partial) {
+                LOG_ERROR(Frontend, "Incomplete exefs/ without main; extract fallback failed");
+                return false;
+            }
+        }
+    }
+    PlaceParkedRomFS(dest_parent);
+    if (has_aoc && !ExeFsDirHasMain(exefs)) {
+        return false;
+    }
+    return true;
 }
 
 static std::optional<u32> ReadArm64InstructionAt(std::span<const u8> text, u32 text_vaddr,
@@ -3216,6 +3247,21 @@ public:
 private:
     bool& flag_;
 };
+
+class WorkDirGuard {
+public:
+    explicit WorkDirGuard(QString path) : path_{std::move(path)} {}
+    ~WorkDirGuard() {
+        if (!path_.isEmpty()) {
+            QDir(path_).removeRecursively();
+        }
+    }
+    WorkDirGuard(const WorkDirGuard&) = delete;
+    WorkDirGuard& operator=(const WorkDirGuard&) = delete;
+
+private:
+    QString path_;
+};
 } // namespace
 
 /// Direct-from-ROM icon+title fallback for when the export ran without ever
@@ -3363,6 +3409,7 @@ void GameExportDialog::OnExport() {
     const QString cache_work = AotCacheDirFor(output_dir, game_name, platform);
     QDir().mkpath(work_dir);
     QDir().mkpath(cache_work);
+    const WorkDirGuard work_cleanup{work_dir};
     progress_bar->setValue(5);
 
     // Step 2: Resolve base + updates/DLC like emulation, then bake PatchManager
@@ -3421,8 +3468,18 @@ void GameExportDialog::OnExport() {
         }
     }
     if (!ExeFsDirHasMain(exefs_work)) {
-        FillMissingExeFsFromRom(work_dir, rom_path);
+        if (!session.GetAoc().empty()) {
+            throw std::runtime_error(
+                "DLC was baked but exefs/main is missing; refusing unpatched main fallback");
+        }
+        if (QDir(exefs_work).exists() &&
+            !QDir(exefs_work).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty()) {
+            if (!FillMissingExeFsFromRom(work_dir, rom_path)) {
+                throw std::runtime_error("Incomplete exefs/ without main; extract fallback failed");
+            }
+        }
     }
+    PlaceParkedRomFS(work_dir);
     if (rom_program_id == 0 && session.GetTitleID() != 0) {
         rom_program_id = session.GetTitleID();
     }
@@ -3487,8 +3544,6 @@ void GameExportDialog::OnExport() {
     }
     progress_bar->setValue(90);
 
-    // Step 6: Clean up working directory
-    QDir(work_dir).removeRecursively();
     progress_bar->setValue(100);
 
     // Determine final output path for display

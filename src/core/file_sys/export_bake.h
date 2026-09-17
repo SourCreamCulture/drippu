@@ -57,8 +57,8 @@ inline std::string_view ExportBakeKindName(ExportBakeItem::Kind kind) {
 }
 
 /// GetPatches can list an update even when PatchExeFS was a no-op (null
-/// base ExeFS). Only keep Update when replace actually produced ExeFS;
-/// only keep DLC when a snapshot was dumped.
+/// base ExeFS) or PatchRomFS could not BKTR. Only keep Update when the
+/// snapshot actually applied both ExeFS replace and RomFS patch.
 inline std::vector<ExportBakeItem> FilterAppliedBakeItems(
     const std::vector<ExportBakeItem>& candidates, bool update_exefs_applied,
     std::size_t dumped_aoc_count) {
@@ -94,6 +94,43 @@ inline std::string FormatFailedAddonNote(std::size_t failed_count) {
     return std::to_string(failed_count) +
            " extra file(s) could not be read. Export will not continue until they "
            "are removed or readable.";
+}
+
+/// Whether an enabled update can honestly be listed as baked.
+/// Directory dumps have no Program NCA, so PatchRomFS cannot BKTR; listing
+/// the update would ship update NSOs against base romfs.bin.
+enum class UpdateBakeDecision {
+    NotPresent,
+    Applied,
+    MissingBaseProgramNca,
+    Incomplete,
+};
+
+inline UpdateBakeDecision DecideUpdateBake(bool update_present, bool has_base_program_nca,
+                                           bool update_exefs_applied, bool update_romfs_applied) {
+    if (!update_present) {
+        return UpdateBakeDecision::NotPresent;
+    }
+    if (!has_base_program_nca) {
+        return UpdateBakeDecision::MissingBaseProgramNca;
+    }
+    if (update_exefs_applied && update_romfs_applied) {
+        return UpdateBakeDecision::Applied;
+    }
+    return UpdateBakeDecision::Incomplete;
+}
+
+inline const char* UpdateBakeRefusal(UpdateBakeDecision decision) {
+    switch (decision) {
+    case UpdateBakeDecision::MissingBaseProgramNca:
+        return "Cannot bake update onto a directory dump: RomFS patching needs the "
+               "base Program NCA (BKTR). Export the original NSP/XCI.";
+    case UpdateBakeDecision::Incomplete:
+        return "Update was found but ExeFS replace and RomFS patch did not both "
+               "apply; refusing a mixed snapshot.";
+    default:
+        return nullptr;
+    }
 }
 
 } // namespace FileSys
