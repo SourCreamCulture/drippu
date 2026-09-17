@@ -1,0 +1,280 @@
+// SPDX-FileCopyrightText: Copyright 2026 suyu Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "core/file_sys/export_content.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <fmt/format.h>
+
+#include "core/core.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/content_archive.h"
+#include "core/file_sys/nca_metadata.h"
+#include "core/file_sys/patch_manager.h"
+#include "core/file_sys/registered_cache.h"
+#include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/service/filesystem/filesystem.h"
+#include "core/loader/loader.h"
+
+namespace FileSys {
+namespace {
+
+std::string LowerExtension(std::string name) {
+    const auto pos = name.rfind('.');
+    if (pos == std::string::npos) {
+        return {};
+    }
+    std::string ext = name.substr(pos);
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext;
+}
+
+std::string SourceLabel(PatchSource source) {
+    switch (source) {
+    case PatchSource::NAND:
+        return "NAND";
+    case PatchSource::SDMC:
+        return "SDMC";
+    case PatchSource::External:
+        return "game directory / picked file";
+    case PatchSource::Packed:
+        return "packed in ROM";
+    case PatchSource::Unknown:
+    default:
+        return "installed";
+    }
+}
+
+bool TitleMatches(u64 base_title_id, u64 other) {
+    return ClassifyTitleRelation(base_title_id, other) != TitleRelation::Unrelated;
+}
+
+} // namespace
+
+ExportContentSession::ExportContentSession()
+    : vfs{std::make_shared<RealVfsFilesystem>()},
+      manual{std::make_unique<ManualContentProvider>()},
+      overlay{std::make_unique<ContentProviderUnion>()} {
+    overlay->SetSlot(ContentProviderUnionSlot::FrontendManual, manual.get());
+}
+
+ExportContentSession::~ExportContentSession() = default;
+
+bool ExportContentSession::RegisterPath(const std::string& path, bool is_base_rom) {
+    auto file = vfs->OpenFile(path, OpenMode::Read);
+    if (!file) {
+        const auto dir = vfs->OpenDirectory(path, OpenMode::Read);
+        if (!dir) {
+            return false;
+        }
+        if (auto main_file = dir->GetFile("main")) {
+            file = std::move(main_file);
+        } else if (const auto exefs = dir->GetSubdirectory("exefs")) {
+            file = exefs->GetFile("main");
+        }
+        if (!file) {
+            // Extracted directory ROM: PatchManager can still apply NAND/manual addons
+            // once title_id is known; there is no container to register.
+            return is_base_rom;
+        }
+    }
+
+    if (manual->AddEntriesFromContainer(file)) {
+        return true;
+    }
+
+    const auto ext = LowerExtension(file->GetName());
+    if (ext == ".nca") {
+        const NCA nca{file};
+        if (nca.GetStatus() == Loader::ResultStatus::Success) {
+            const auto title = nca.GetTitleId();
+            const auto record = GetCRTypeFromNCAType(nca.GetType());
+            TitleType type = TitleType::Application;
+            switch (ClassifyTitleRelation(GetBaseTitleID(title), title)) {
+            case TitleRelation::Update:
+                type = TitleType::Update;
+                break;
+            case TitleRelation::Aoc:
+                type = TitleType::AOC;
+                break;
+            default:
+                type = TitleType::Application;
+                break;
+            }
+            manual->AddEntry(type, record, title, file);
+            return true;
+        }
+    }
+
+    return is_base_rom;
+}
+
+void ExportContentSession::CopyMatchingManualEntries(const ContentProvider& source) {
+    static constexpr std::array types{TitleType::Application, TitleType::Update, TitleType::AOC};
+    for (const auto title_type : types) {
+        for (const auto& entry : source.ListEntriesFilter(title_type, {}, {})) {
+            if (!TitleMatches(title_id, entry.title_id)) {
+                continue;
+            }
+            if (auto raw = source.GetEntryRaw(entry)) {
+                manual->AddEntry(title_type, entry.type, entry.title_id, raw);
+            }
+        }
+    }
+}
+
+bool ExportContentSession::ApplyPatches(Core::System& system) {
+    const auto& fsc = system.GetFileSystemController();
+    const PatchManager pm{title_id, fsc, *overlay};
+
+    base_program_nca = overlay->GetEntry(title_id, ContentRecordType::Program);
+    VirtualDir base_exefs = base_program_nca ? base_program_nca->GetExeFS() : nullptr;
+    VirtualFile base_romfs = base_program_nca ? base_program_nca->GetRomFS() : nullptr;
+
+    patched_exefs = pm.PatchExeFS(base_exefs);
+    patched_romfs =
+        pm.PatchRomFS(base_program_nca.get(), base_romfs, ContentRecordType::Program);
+
+    aoc.clear();
+    for (const auto& entry :
+         overlay->ListEntriesFilter(TitleType::AOC, ContentRecordType::Data, {})) {
+        if (ClassifyTitleRelation(title_id, entry.title_id) != TitleRelation::Aoc) {
+            continue;
+        }
+        auto aoc_nca = overlay->GetEntry(entry.title_id, ContentRecordType::Data);
+        if (!aoc_nca || aoc_nca->GetStatus() != Loader::ResultStatus::Success) {
+            continue;
+        }
+        const PatchManager aoc_pm{entry.title_id, fsc, *overlay};
+        auto aoc_romfs =
+            aoc_pm.PatchRomFS(aoc_nca.get(), aoc_nca->GetRomFS(), ContentRecordType::Data);
+        if (!aoc_romfs) {
+            aoc_romfs = aoc_nca->GetRomFS();
+        }
+        if (aoc_romfs) {
+            aoc.push_back(ExportAocSnapshot{entry.title_id, std::move(aoc_romfs)});
+        }
+        held_aoc_ncas.push_back(std::move(aoc_nca));
+    }
+
+    const auto patches = pm.GetPatches();
+    bake_items.clear();
+    for (const auto& patch : patches) {
+        if (!patch.enabled) {
+            continue;
+        }
+        if (patch.type == PatchType::Update) {
+            ExportBakeItem item;
+            item.kind = ExportBakeItem::Kind::Update;
+            item.name = patch.version.empty() ? patch.name : fmt::format("{} {}", patch.name, patch.version);
+            item.source = SourceLabel(patch.source);
+            bake_items.push_back(std::move(item));
+        } else if (patch.type == PatchType::DLC) {
+            ExportBakeItem item;
+            item.kind = ExportBakeItem::Kind::Dlc;
+            item.name = patch.version.empty() ? patch.name : fmt::format("{} {}", patch.name, patch.version);
+            item.source = SourceLabel(patch.source);
+            bake_items.push_back(std::move(item));
+        }
+    }
+    status = FormatExportBakeStatus(bake_items);
+    return true;
+}
+
+bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequest& request) {
+    error.clear();
+    failed_addon_paths.clear();
+    bake_items.clear();
+    aoc.clear();
+    patched_exefs = nullptr;
+    patched_romfs = nullptr;
+    base_program_nca.reset();
+    held_aoc_ncas.clear();
+    title_id = request.title_id;
+    status.clear();
+
+    manual->ClearAllEntries();
+    overlay = std::make_unique<ContentProviderUnion>();
+    overlay->SetSlot(ContentProviderUnionSlot::FrontendManual, manual.get());
+
+    if (request.rom_path.empty()) {
+        error = "No ROM path";
+        status = FormatExportBakeStatus(bake_items);
+        return false;
+    }
+
+    if (!RegisterPath(request.rom_path, true)) {
+        error = "Could not open the base ROM";
+        status = FormatExportBakeStatus(bake_items);
+        return false;
+    }
+
+    if (title_id == 0) {
+        if (auto file = vfs->OpenFile(request.rom_path, OpenMode::Read)) {
+            if (auto loader = Loader::GetLoader(system, file)) {
+                loader->ReadProgramId(title_id);
+            }
+        } else if (auto dir = vfs->OpenDirectory(request.rom_path, OpenMode::Read)) {
+            FileSys::VirtualFile main_file = dir->GetFile("main");
+            if (!main_file) {
+                if (const auto exefs = dir->GetSubdirectory("exefs")) {
+                    main_file = exefs->GetFile("main");
+                }
+            }
+            if (main_file) {
+                if (auto loader = Loader::GetLoader(system, main_file)) {
+                    loader->ReadProgramId(title_id);
+                }
+            }
+        }
+        title_id = GetBaseTitleID(title_id);
+    }
+
+    if (const auto* sys_manual =
+            system.GetContentProviderUnion().GetSlotProvider(ContentProviderUnionSlot::FrontendManual);
+        sys_manual != nullptr && title_id != 0) {
+        CopyMatchingManualEntries(*sys_manual);
+    }
+
+    for (const auto& extra : request.extra_addon_paths) {
+        if (!RegisterPath(extra, false)) {
+            failed_addon_paths.push_back(extra);
+        }
+    }
+
+    auto& sys_union = system.GetContentProviderUnion();
+    if (request.use_nand_addons) {
+        overlay->SetSlot(ContentProviderUnionSlot::SysNAND,
+                         sys_union.GetSlotProvider(ContentProviderUnionSlot::SysNAND));
+        overlay->SetSlot(ContentProviderUnionSlot::UserNAND,
+                         sys_union.GetSlotProvider(ContentProviderUnionSlot::UserNAND));
+        overlay->SetSlot(ContentProviderUnionSlot::SDMC,
+                         sys_union.GetSlotProvider(ContentProviderUnionSlot::SDMC));
+    }
+    overlay->SetSlot(ContentProviderUnionSlot::External,
+                     sys_union.GetSlotProvider(ContentProviderUnionSlot::External));
+
+    if (title_id == 0) {
+        error = "Could not determine title ID";
+        status = FormatExportBakeStatus(bake_items);
+        return false;
+    }
+
+    ApplyPatches(system);
+
+    if (!failed_addon_paths.empty()) {
+        status += fmt::format(" {} extra file(s) could not be read.", failed_addon_paths.size());
+    }
+    return true;
+}
+
+std::string DescribeExportContent(Core::System& system, const ExportContentRequest& request) {
+    ExportContentSession session;
+    session.Resolve(system, request);
+    return session.GetStatus();
+}
+
+} // namespace FileSys

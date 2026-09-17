@@ -13,6 +13,8 @@
 #include "core/arm/recomp/recomp_image_abi.h"
 #include "core/arm/recomp/recomp_session.h"
 #include "core/arm/recomp/unresolved_import.h"
+#include "core/file_sys/common_funcs.h"
+#include "core/file_sys/export_bake.h"
 #include "smoke_config.h"
 
 #include <atomic>
@@ -1291,6 +1293,44 @@ void TestCacheInvalidation() {
     }
 }
 
+void TestExportAddonClassification() {
+    constexpr u64 base = 0x0100AABBCCDDE000ULL;
+    constexpr u64 update = base | 0x800;
+    constexpr u64 aoc = FileSys::GetAOCBaseTitleID(base) + 3;
+    if (FileSys::ClassifyTitleRelation(base, base) != FileSys::TitleRelation::Base) {
+        fail("base title classified incorrectly");
+    } else if (FileSys::ClassifyTitleRelation(base, update) != FileSys::TitleRelation::Update) {
+        fail("update title classified incorrectly");
+    } else if (FileSys::ClassifyTitleRelation(base, aoc) != FileSys::TitleRelation::Aoc) {
+        fail("AOC title classified incorrectly");
+    } else if (FileSys::GetAOCID(aoc) != 3) {
+        fail("GetAOCID mismatch");
+    } else {
+        pass("title relation classifies base / update / AOC");
+    }
+
+    const std::string none = FileSys::FormatExportBakeStatus({});
+    if (none.find("base game only") == std::string::npos ||
+        none.find("no NAND install") == std::string::npos) {
+        fail("empty bake status missing snapshot wording: " + none);
+    } else {
+        pass("empty bake status is base-only snapshot");
+    }
+
+    const std::vector<FileSys::ExportBakeItem> items{
+        {FileSys::ExportBakeItem::Kind::Update, "Update v16.0.0", "picked file"},
+        {FileSys::ExportBakeItem::Kind::Dlc, "DLC 1, 7", "NAND"},
+    };
+    const std::string status = FileSys::FormatExportBakeStatus(items);
+    if (status.find("Update v16.0.0") == std::string::npos ||
+        status.find("DLC 1, 7") == std::string::npos || status.find("NAND") == std::string::npos ||
+        status.find("Standalone snapshot") == std::string::npos) {
+        fail("bake status missing baked addons: " + status);
+    } else {
+        pass("bake status lists update, DLC, and snapshot note");
+    }
+}
+
 void DummyBlock(void* c) {
     (void)c;
 }
@@ -1684,6 +1724,7 @@ int main() {
     TestUnresolvedImportPolicy();
     TestModuleRegistrationSession();
     TestCacheInvalidation();
+    TestExportAddonClassification();
     TestSharedImageAbi(root);
     TestAotCacheReuse();
 
