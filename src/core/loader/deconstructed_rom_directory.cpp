@@ -292,9 +292,9 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
         if (const auto parent = dir->GetParentDirectory()) {
             if (const auto aoc_dir = parent->GetSubdirectory("aoc")) {
                 for (const auto& sub : aoc_dir->GetSubdirectories()) {
-                    const auto& name = sub->GetName();
+                    const auto& aoc_dir_name = sub->GetName();
                     char* end = nullptr;
-                    const u64 tid = std::strtoull(name.c_str(), &end, 16);
+                    const u64 tid = std::strtoull(aoc_dir_name.c_str(), &end, 16);
                     if (end == nullptr || *end != '\0' || tid == 0) {
                         continue;
                     }
