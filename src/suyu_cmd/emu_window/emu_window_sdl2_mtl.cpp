@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Apple SDL Metal window stub only. Live macOS rendering is Vulkan via
+// EmuWindow_SDL2_VK + MoltenVK. This translation unit is target_sources'd on
+// APPLE as a hook for a future native Metal backend; it does not include
+// renderer_metal or construct a Metal GPU renderer.
+
 #include <cstdlib>
 #include <memory>
 #include <string>
