@@ -7,6 +7,8 @@
 //
 // STR/LDR of x0 through the opaque host_mem callbacks sit on the ADD
 // recurrence so gcc -O3 cannot strength-reduce 512 ADDs to `x1 << 9`.
+// The harness also feeds a synthetic folded objdump (`shl $0x9` + SVC jmp)
+// to JudgeAotBenchDump and requires FAIL; a jmp to recomp_svc@plt is not a loop.
 // X1 = 1 and X3 = data-segment scratch, both set by the harness.
 //
 // Guest PC offset: 0x2400 (past the 8-byte STR at 0x1FFC).

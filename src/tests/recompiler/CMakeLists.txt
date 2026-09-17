@@ -6,7 +6,8 @@
 # tools/static_recompiler.
 #
 # Nested full-tree target recomp_stack_harness also races JIT vs hybrid AOT
-# (drippu backlog #3) and writes recomp_benchmark.json.
+# (drippu backlog #3) and writes recomp_benchmark.json. The objdump pin
+# rejects a synthetic shl $0x9 + jmp recomp_svc@plt dump before bootstrap.
 
 cmake_minimum_required(VERSION 3.13)
 

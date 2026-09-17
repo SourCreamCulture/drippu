@@ -15,7 +15,9 @@
 //
 // The bench ADD chain is punctuated with STR/LDR of x0 through the opaque
 // host_mem callbacks so Release (-O3) cannot strength-reduce 512 ADDs to
-// `x1 << 9`. objdump of block_bench must not look like a single shift.
+// `x1 << 9`. JudgeAotBenchDump is the objdump pin: a synthetic
+// `shl $0x9` + `jmp recomp_svc@plt` dump must FAIL (a lower PLT address is
+// not an in-function loop). Live -O3 must PASS (adds + store/load).
 //
 // Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
 // safe live HLE). Does not load copyrighted titles or keys.
@@ -222,6 +224,9 @@ struct AotCompileCosts {
     u64 disasm_shl9_count{};
     u64 disasm_imul512_count{};
     u64 disasm_backward_jumps{};
+    u64 disasm_plt_jumps{};
+    u64 disasm_store64_calls{};
+    u64 disasm_load64_calls{};
     bool not_single_shift{};
     std::string disasm_excerpt;
 };
@@ -309,6 +314,214 @@ std::string HostCpu() {
     return {};
 }
 
+struct DisasmCounts {
+    u64 add{};
+    u64 shl9{};
+    u64 imul512{};
+    u64 backward_jumps{}; // in-function backedges only (not jmp to a lower PLT)
+    u64 plt_jumps{};
+    u64 call{};
+    u64 store64{};
+    u64 load64{};
+};
+
+struct BenchDumpVerdict {
+    bool ok{};
+    const char* reason = "";
+};
+
+// "$0x9" must not match "$0x90". Next char is end, comma, or whitespace.
+bool HasImmToken(const std::string& args, std::string_view imm) {
+    size_t p = 0;
+    while ((p = args.find(imm.data(), p, imm.size())) != std::string::npos) {
+        const size_t after = p + imm.size();
+        const char c = after < args.size() ? args[after] : '\0';
+        if (c == '\0' || c == ',' || std::isspace(static_cast<unsigned char>(c))) {
+            return true;
+        }
+        ++p;
+    }
+    return false;
+}
+
+DisasmCounts CountBlockBenchOps(const std::string& fn) {
+    DisasmCounts c;
+    std::vector<std::pair<u64, u64>> jumps;
+    u64 fn_lo = ~u64{0};
+    u64 fn_hi = 0;
+    std::istringstream in(fn);
+    std::string line;
+    while (std::getline(in, line)) {
+        u64 addr = std::strtoull(line.c_str(), nullptr, 16);
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        const auto tab = line.rfind('\t');
+        if (tab == std::string::npos) {
+            continue;
+        }
+        if (addr != 0) {
+            fn_lo = std::min(fn_lo, addr);
+            fn_hi = std::max(fn_hi, addr);
+        }
+        std::string rest = line.substr(tab + 1);
+        while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front()))) {
+            rest.erase(rest.begin());
+        }
+        const auto first = rest.find(' ');
+        const std::string mnem = first == std::string::npos ? rest : rest.substr(0, first);
+        const std::string args = first == std::string::npos ? std::string{} : rest.substr(first);
+        if (mnem == "add" || mnem == "addq") {
+            if (args.find("%rsp") == std::string::npos && args.find("%rbp") == std::string::npos) {
+                ++c.add;
+            }
+        } else if (mnem == "shl" || mnem == "shlq" || mnem == "sal" || mnem == "salq") {
+            if (HasImmToken(args, "$0x9") || HasImmToken(args, "$9")) {
+                ++c.shl9;
+            }
+        } else if (mnem == "imul" || mnem == "imulq") {
+            if (HasImmToken(args, "$0x200") || HasImmToken(args, "$512")) {
+                ++c.imul512;
+            }
+        } else if (mnem == "call" || mnem == "callq") {
+            ++c.call;
+            if (line.find("recomp_store64") != std::string::npos) {
+                ++c.store64;
+            }
+            if (line.find("recomp_load64") != std::string::npos) {
+                ++c.load64;
+            }
+        } else if (!mnem.empty() && mnem[0] == 'j') {
+            size_t t = 0;
+            while (t < args.size() && std::isspace(static_cast<unsigned char>(args[t]))) {
+                ++t;
+            }
+            u64 target = 0;
+            if (t < args.size()) {
+                target = std::strtoull(args.c_str() + t, nullptr, 16);
+            }
+            if (addr != 0 && target != 0) {
+                jumps.emplace_back(addr, target);
+            }
+        }
+    }
+    for (const auto& [from, to] : jumps) {
+        const bool in_fn = fn_lo != ~u64{0} && to >= fn_lo && to <= fn_hi;
+        if (in_fn && to < from) {
+            ++c.backward_jumps;
+        } else if (!in_fn && to < from) {
+            ++c.plt_jumps;
+        }
+    }
+    return c;
+}
+
+// Folded x1<<9 must lose even when an SVC jmp to a lower PLT looks "backward".
+BenchDumpVerdict JudgeAotBenchDump(const DisasmCounts& n) {
+    if (n.shl9 > 0 || n.imul512 > 0) {
+        return {false, "host fold: shl $0x9 / imul $512"};
+    }
+    if (n.store64 < 1 || n.load64 < 1) {
+        return {false, "missing recomp_store64/recomp_load64 (add-only is foldable)"};
+    }
+    if (n.add >= static_cast<u64>(kBenchAdds)) {
+        return {true, "unrolled >=512 adds with store/load"};
+    }
+    if (n.backward_jumps >= 1 && n.add >= 1) {
+        return {true, "in-function add loop with store/load"};
+    }
+    return {false, "too few adds and no in-function loop"};
+}
+
+void RecordBenchDump(const DisasmCounts& n, const std::string& fn) {
+    g_aot_compile.disasm_add_count = n.add;
+    g_aot_compile.disasm_shl9_count = n.shl9;
+    g_aot_compile.disasm_imul512_count = n.imul512;
+    g_aot_compile.disasm_backward_jumps = n.backward_jumps;
+    g_aot_compile.disasm_plt_jumps = n.plt_jumps;
+    g_aot_compile.disasm_store64_calls = n.store64;
+    g_aot_compile.disasm_load64_calls = n.load64;
+    std::istringstream lines(fn);
+    std::string line;
+    int kept = 0;
+    std::ostringstream excerpt;
+    while (std::getline(lines, line) && kept < 40) {
+        excerpt << line << '\n';
+        ++kept;
+    }
+    g_aot_compile.disasm_excerpt = excerpt.str();
+    const auto v = JudgeAotBenchDump(n);
+    g_aot_compile.not_single_shift = v.ok;
+    std::cout << "AOT block_bench objdump: add=" << n.add << " shl9=" << n.shl9
+              << " imul512=" << n.imul512 << " in_fn_back_jcc=" << n.backward_jumps
+              << " plt_jmp=" << n.plt_jumps << " store64=" << n.store64
+              << " load64=" << n.load64 << " call=" << n.call << " -> " << v.reason << "\n";
+}
+
+void ExpectDumpVerdict(const char* name, const std::string& dump, bool want_ok) {
+    const DisasmCounts n = CountBlockBenchOps(dump);
+    const auto v = JudgeAotBenchDump(n);
+    if (v.ok != want_ok) {
+        Fail(std::string(name) + ": verdict=" + (v.ok ? "PASS" : "FAIL") + " (" + v.reason +
+             ") want " + (want_ok ? "PASS" : "FAIL") + " add=" + std::to_string(n.add) +
+             " shl9=" + std::to_string(n.shl9) + " back=" + std::to_string(n.backward_jumps) +
+             " plt_jmp=" + std::to_string(n.plt_jumps) + " store=" + std::to_string(n.store64) +
+             " load=" + std::to_string(n.load64));
+    } else {
+        Pass(std::string(name) + " (" + v.reason + ")");
+    }
+}
+
+void ScenarioFoldPinSelfCheck() {
+    const int before = g_fails;
+    // Tabs match GNU objdump. PLT is at a lower address than block_bench, so a
+    // naive "target < addr" count treats SVC jmp as a loop. Must still FAIL.
+    const std::string folded_shl_svc_jmp =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 8b 77 08         \tmov    0x8(%rdi),%rsi\n"
+        "    1414:\t48 c1 e6 09         \tshl    $0x9,%rsi\n"
+        "    1418:\t48 01 37            \tadd    %rsi,(%rdi)\n"
+        "    141b:\te9 a0 fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("folded shl $0x9 + SVC jmp is rejected", folded_shl_svc_jmp, false);
+
+    // Store/load calls must not rescue a shift-fold (shl9 is fatal).
+    const std::string folded_shl_named_plt =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 c1 e6 09         \tshl    $0x9,%rsi\n"
+        "    1414:\te8 87 fc ff ff      \tcall   10a0 <recomp_store64@plt>\n"
+        "    1419:\te8 92 fc ff ff      \tcall   10b0 <recomp_load64@plt>\n"
+        "    141e:\te9 9d fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("folded shl $0x9 still rejected with store/load calls",
+                      folded_shl_named_plt, false);
+
+    const std::string folded_imul =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 69 f6 00 02 00 00\timul   $0x200,%rsi,%rsi\n"
+        "    1417:\t48 01 37            \tadd    %rsi,(%rdi)\n"
+        "    141a:\te8 a1 fc ff ff      \tcall   10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("folded imul $512 + SVC call is rejected", folded_imul, false);
+
+    const std::string add_only =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 03 47 08         \tadd    0x8(%rdi),%rax\n"
+        "    1414:\t48 03 47 08         \tadd    0x8(%rdi),%rax\n"
+        "    1418:\te9 a3 fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    ExpectDumpVerdict("add-only dump (no store/load) is rejected", add_only, false);
+
+    const std::string honest_loop =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\t48 c7 07 00 00 00 00\tmovq   $0x0,(%rdi)\n"
+        "    1417:\te8 84 fc ff ff      \tcall   10a0 <recomp_store64@plt>\n"
+        "    141c:\te8 8f fc ff ff      \tcall   10b0 <recomp_load64@plt>\n"
+        "    1421:\t48 03 43 08         \tadd    0x8(%rbx),%rax\n"
+        "    1425:\t75 f0               \tjne    1417 <block_bench+0x7>\n"
+        "    1427:\tc3                  \tret\n";
+    ExpectDumpVerdict("in-function add+store+load loop is accepted", honest_loop, true);
+
+    ScenarioPass("objdump fold pin rejects shl $0x9 + SVC jmp", before);
+}
+
 #ifndef _WIN32
 std::string PopenDump(const std::string& cmd) {
     FILE* p = popen(cmd.c_str(), "r");
@@ -341,69 +554,6 @@ std::string ExtractObjdumpFn(const std::string& dump, const char* name) {
     return dump.substr(from);
 }
 
-struct DisasmCounts {
-    u64 add{};
-    u64 shl9{};
-    u64 imul512{};
-    u64 backward_jumps{};
-    u64 call{};
-};
-
-DisasmCounts CountBlockBenchOps(const std::string& fn) {
-    DisasmCounts c;
-    std::istringstream in(fn);
-    std::string line;
-    while (std::getline(in, line)) {
-        const auto colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
-        }
-        u64 addr = 0;
-        addr = std::strtoull(line.c_str(), nullptr, 16);
-        // Mnemonic sits after the last tab (GNU objdump: addr:\tbytes\tmnemonic).
-        const auto tab = line.rfind('\t');
-        if (tab == std::string::npos) {
-            continue;
-        }
-        std::string rest = line.substr(tab + 1);
-        while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front()))) {
-            rest.erase(rest.begin());
-        }
-        auto first = rest.find(' ');
-        const std::string mnem = first == std::string::npos ? rest : rest.substr(0, first);
-        const std::string args = first == std::string::npos ? std::string{} : rest.substr(first);
-        if (mnem == "add" || mnem == "addq") {
-            if (args.find("%rsp") == std::string::npos && args.find("%rbp") == std::string::npos) {
-                ++c.add;
-            }
-        } else if (mnem == "shl" || mnem == "shlq" || mnem == "sal" || mnem == "salq") {
-            if (args.find("$0x9,") != std::string::npos || args.find("$9,") != std::string::npos ||
-                args.find("$0x9 ") != std::string::npos || args.find("$9 ") != std::string::npos) {
-                ++c.shl9;
-            }
-        } else if (mnem == "imul" || mnem == "imulq") {
-            if (args.find("$0x200") != std::string::npos || args.find("$512") != std::string::npos) {
-                ++c.imul512;
-            }
-        } else if (mnem == "call" || mnem == "callq") {
-            ++c.call;
-        } else if (!mnem.empty() && mnem[0] == 'j') {
-            u64 target = 0;
-            size_t t = 0;
-            while (t < args.size() && std::isspace(static_cast<unsigned char>(args[t]))) {
-                ++t;
-            }
-            if (t < args.size()) {
-                target = std::strtoull(args.c_str() + t, nullptr, 16);
-            }
-            if (addr != 0 && target != 0 && target < addr) {
-                ++c.backward_jumps;
-            }
-        }
-    }
-    return c;
-}
-
 void PinAotBenchNotFolded(const fs::path& so) {
     const std::string cmd = "objdump -d " + Quote(so.string()) + " 2>/dev/null";
     const std::string dump = PopenDump(cmd);
@@ -417,34 +567,14 @@ void PinAotBenchNotFolded(const fs::path& so) {
         return;
     }
     const DisasmCounts n = CountBlockBenchOps(fn);
-    g_aot_compile.disasm_add_count = n.add;
-    g_aot_compile.disasm_shl9_count = n.shl9;
-    g_aot_compile.disasm_imul512_count = n.imul512;
-    g_aot_compile.disasm_backward_jumps = n.backward_jumps;
-    std::istringstream lines(fn);
-    std::string line;
-    int kept = 0;
-    std::ostringstream excerpt;
-    while (std::getline(lines, line) && kept < 40) {
-        excerpt << line << '\n';
-        ++kept;
-    }
-    g_aot_compile.disasm_excerpt = excerpt.str();
-
-    const bool folded_to_shift =
-        (n.shl9 > 0 || n.imul512 > 0) && n.add < 8 && n.backward_jumps == 0;
-    const bool honest_unroll = n.add >= static_cast<u64>(kBenchAdds / 4);
-    const bool honest_loop = n.backward_jumps >= 1 && n.add >= 1;
-    g_aot_compile.not_single_shift = !folded_to_shift && (honest_unroll || honest_loop);
-
-    std::cout << "AOT block_bench objdump: add=" << n.add << " shl9=" << n.shl9
-              << " imul512=" << n.imul512 << " back_jcc=" << n.backward_jumps
-              << " call=" << n.call << "\n";
+    RecordBenchDump(n, fn);
     if (!g_aot_compile.not_single_shift) {
         Fail("AOT block_bench was host-folded (x1<<9 / imul 512), not 512 adds; dump:\n" + fn);
         return;
     }
     ExpectTrue("AOT block_bench is not a single x1<<9", g_aot_compile.not_single_shift);
+    ExpectTrue("AOT block_bench has recomp_store64 calls in dump", n.store64 >= 1);
+    ExpectTrue("AOT block_bench has recomp_load64 calls in dump", n.load64 >= 1);
 }
 #endif
 
@@ -1495,7 +1625,8 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"identical_across_backends", true},
           {"anti_fold",
            "each ADD is preceded by STR/LDR of x0 through host_mem function pointers "
-           "so -O3 cannot reduce 512 ADDs to x1<<9"},
+           "so -O3 cannot reduce 512 ADDs to x1<<9; JudgeAotBenchDump FAILs a "
+           "synthetic shl $0x9 + jmp recomp_svc@plt dump (PLT jmp is not a loop)"},
           {"guest_pc_offset", "0x2400"},
           {"entry_pc", entry_pc.str()},
           {"guest_instruction_count", kBenchAdds * 3 + 2},
@@ -1523,11 +1654,17 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"so_path", g_aot_compile.so_path},
           {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes},
           {"host_opt_check",
-           {{"method", "objdump -d <block_bench>"},
+           {{"method", "objdump -d <block_bench> + JudgeAotBenchDump"},
+            {"pin",
+             "FAIL if shl $0x9 / imul $512, or if store64/load64 missing; a jmp to "
+             "a lower recomp_svc@plt is plt_jumps not an in-function loop"},
             {"add_mnemonics", g_aot_compile.disasm_add_count},
             {"shift_by_9", g_aot_compile.disasm_shl9_count},
             {"imul_512", g_aot_compile.disasm_imul512_count},
             {"backward_jumps", g_aot_compile.disasm_backward_jumps},
+            {"plt_jumps", g_aot_compile.disasm_plt_jumps},
+            {"store64_calls", g_aot_compile.disasm_store64_calls},
+            {"load64_calls", g_aot_compile.disasm_load64_calls},
             {"not_single_shift", g_aot_compile.not_single_shift},
             {"excerpt", g_aot_compile.disasm_excerpt}}}}},
         {"modes", {{"hybrid_aot", ModeToJson(aot)}, {"jit", ModeToJson(jit)}}},
@@ -1560,6 +1697,12 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
     ExpectTrue("bench JSON jit mode", json.find("\"jit\"") != std::string::npos);
     ExpectTrue("bench JSON not_single_shift",
                json.find("\"not_single_shift\": true") != std::string::npos);
+    ExpectTrue("bench JSON store64_calls > 0",
+               json.find("\"store64_calls\":") != std::string::npos &&
+                   json.find("\"store64_calls\": 0") == std::string::npos);
+    ExpectTrue("bench JSON load64_calls > 0",
+               json.find("\"load64_calls\":") != std::string::npos &&
+                   json.find("\"load64_calls\": 0") == std::string::npos);
     std::cout << "recomp_benchmark.json path: " << path << "\n";
     std::cout << "=== recomp_benchmark.json ===\n" << json << std::endl;
     ScenarioPass("JIT vs hybrid AOT benchmark JSON from identical guest fixture", before);
@@ -1635,7 +1778,8 @@ void PrintGaps() {
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
         << "  leftover pending_svc cleared on StepThread, live AOT/Dynarmic timers +\n"
         << "  fallback reasons + icache JSON export (path-safe tmp+rename),\n"
-        << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json).\n";
+        << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json),\n"
+        << "  JudgeAotBenchDump FAILs synthetic shl $0x9 + SVC plt jmp; live -O3 PASS.\n";
 }
 
 } // namespace
@@ -1645,6 +1789,8 @@ int main() {
     std::cerr << std::unitbuf;
     std::cout << "recomp_stack_harness: SetRecompLookup ArmRecomp + Translate AOT + Dynarmic\n";
     std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark)\n";
+
+    ScenarioFoldPinSelfCheck();
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const fs::path root =

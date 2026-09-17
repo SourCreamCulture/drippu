@@ -84,8 +84,10 @@ RecompLookupFn GetRecompLookup();
 /// harness races the same guest fixture under JIT vs hybrid AOT and writes
 /// `recomp_benchmark.json` (`kind=recomp_benchmark`), embedding per-mode
 /// GetRecompExecutionMetrics() deltas. The bench ADD chain is STR/LDR-punctuated
-/// so host -O3 cannot fold it to `x1 << 9`; the harness objdumps `block_bench`
-/// and fails if that fold is present. Override with $SUYU_RECOMP_BENCHMARK_JSON.
+/// so host -O3 cannot fold it to `x1 << 9`. The harness objdumps `block_bench`
+/// and JudgeAotBenchDump fails on `shl $0x9` / `imul $512` even when the SVC
+/// is a `jmp` to a lower PLT (that jump is not a loop). Override with
+/// $SUYU_RECOMP_BENCHMARK_JSON.
 /// Default path: $SUYU_RECOMP_EXECUTION_JSON, else `{LogDir}/recomp_execution.json`
 /// (Linux: ~/.local/share/suyu/log/recomp_execution.json unless portable `user/`).
 /// WriteRecompExecutionJson keeps `std::filesystem::path` (no narrow `.string()`
