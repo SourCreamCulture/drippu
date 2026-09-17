@@ -1329,6 +1329,37 @@ void TestExportAddonClassification() {
     } else {
         pass("bake status lists update, DLC, and snapshot note");
     }
+
+    const std::vector<FileSys::ExportBakeItem> candidates{
+        {FileSys::ExportBakeItem::Kind::Update, "Update v1.0.0", "NAND"},
+        {FileSys::ExportBakeItem::Kind::Dlc, "DLC 1", "picked file"},
+    };
+    const auto omitted = FileSys::FilterAppliedBakeItems(candidates, false, 0);
+    if (!omitted.empty()) {
+        fail("FilterAppliedBakeItems listed update without ExeFS replace");
+    } else {
+        pass("FilterAppliedBakeItems omits unapplied update");
+    }
+    const auto dlc_kept = FileSys::FilterAppliedBakeItems(candidates, false, 1);
+    if (dlc_kept.size() != 1 || dlc_kept[0].kind != FileSys::ExportBakeItem::Kind::Dlc) {
+        fail("FilterAppliedBakeItems dropped dumped DLC");
+    } else {
+        pass("FilterAppliedBakeItems keeps dumped DLC only");
+    }
+    const std::string fail_note = FileSys::FormatFailedAddonNote(1);
+    if (fail_note.find("will not continue") == std::string::npos) {
+        fail("failed-addon note missing abort wording: " + fail_note);
+    } else {
+        pass("failed extras abort export");
+    }
+
+    constexpr u64 update_npdm = base | 0x800;
+    if (FileSys::GetBaseTitleID(update_npdm) != base ||
+        FileSys::GetBaseTitleID(aoc) != FileSys::GetBaseTitleID(update_npdm)) {
+        fail("AOC Count/List base id disagrees for update NPDM");
+    } else {
+        pass("AOC Count/List share GetBaseTitleID including update NPDM");
+    }
 }
 
 void DummyBlock(void* c) {

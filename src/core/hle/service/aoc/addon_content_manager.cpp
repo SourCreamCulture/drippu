@@ -32,6 +32,12 @@ static bool CheckAOCTitleIDMatchesBase(u64 title_id, u64 base) {
     return FileSys::GetBaseTitleID(title_id) == base;
 }
 
+static u64 CurrentAocApplicationId(Core::System& system) {
+    // Count and List must use the same id. A patched ExeFS NPDM can report
+    // base|0x800; AOC title ids still compare against the base application.
+    return FileSys::GetBaseTitleID(system.GetApplicationProcessProgramID());
+}
+
 static std::vector<u64> AccumulateAOCTitleIDs(Core::System& system) {
     std::vector<u64> add_on_content;
     const auto& rcu = system.GetContentProvider();
@@ -92,7 +98,7 @@ IAddOnContentManager::~IAddOnContentManager() {
 Result IAddOnContentManager::CountAddOnContent(Out<u32> out_count, ClientProcessId process_id) {
     LOG_DEBUG(Service_AOC, "called. process_id={}", process_id.pid);
 
-    const auto current = system.GetApplicationProcessProgramID();
+    const auto current = CurrentAocApplicationId(system);
 
     const auto& disabled = Settings::values.disabled_addons[current];
     if (std::find(disabled.begin(), disabled.end(), "DLC") != disabled.end()) {
@@ -120,7 +126,7 @@ Result IAddOnContentManager::ListAddOnContent(Out<u32> out_count,
     LOG_DEBUG(Service_AOC, "called with offset={}, count={}, process_id={}", offset, count,
               process_id.pid);
 
-    const auto current = FileSys::GetBaseTitleID(system.GetApplicationProcessProgramID());
+    const auto current = CurrentAocApplicationId(system);
 
     std::vector<u32> out;
     const auto& disabled = Settings::values.disabled_addons[current];

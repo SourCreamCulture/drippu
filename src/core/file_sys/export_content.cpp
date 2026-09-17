@@ -70,15 +70,39 @@ bool ExportContentSession::RegisterPath(const std::string& path, bool is_base_ro
         if (!dir) {
             return false;
         }
+        VirtualDir dir_exefs;
         if (auto main_file = dir->GetFile("main")) {
             file = std::move(main_file);
+            dir_exefs = dir;
         } else if (const auto exefs = dir->GetSubdirectory("exefs")) {
             file = exefs->GetFile("main");
+            dir_exefs = exefs;
+        }
+        if (is_base_rom && dir_exefs) {
+            directory_exefs = dir_exefs;
+            if (auto parent = dir_exefs->GetParentDirectory()) {
+                directory_romfs = parent->GetFile("romfs.bin");
+                if (!directory_romfs) {
+                    directory_romfs = parent->GetFile("romfs");
+                }
+            }
+            if (!directory_romfs) {
+                directory_romfs = dir_exefs->GetFile("romfs.bin");
+                if (!directory_romfs) {
+                    directory_romfs = dir_exefs->GetFile("romfs");
+                }
+            }
+            if (!directory_romfs) {
+                directory_romfs = dir->GetFile("romfs.bin");
+                if (!directory_romfs) {
+                    directory_romfs = dir->GetFile("romfs");
+                }
+            }
         }
         if (!file) {
             // Extracted directory ROM: PatchManager can still apply NAND/manual addons
-            // once title_id is known; there is no container to register.
-            return is_base_rom;
+            // once title_id is known if we kept the ExeFS directory above.
+            return is_base_rom && directory_exefs != nullptr;
         }
     }
 
@@ -133,10 +157,39 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
     base_program_nca = overlay->GetEntry(title_id, ContentRecordType::Program);
     VirtualDir base_exefs = base_program_nca ? base_program_nca->GetExeFS() : nullptr;
     VirtualFile base_romfs = base_program_nca ? base_program_nca->GetRomFS() : nullptr;
+    if (!base_exefs) {
+        base_exefs = directory_exefs;
+    }
+    if (!base_romfs) {
+        base_romfs = directory_romfs;
+    }
 
-    patched_exefs = pm.PatchExeFS(base_exefs);
+    const u64 update_tid = GetUpdateTitleID(title_id);
+    held_update_nca = overlay->GetEntry(update_tid, ContentRecordType::Program);
+    VirtualDir update_exefs;
+    if (held_update_nca && held_update_nca->GetStatus() == Loader::ResultStatus::Success) {
+        update_exefs = held_update_nca->GetExeFS();
+    }
+
+    update_exefs_applied = false;
+    if (base_exefs) {
+        // PatchExeFS(nullptr) is a no-op; a directory ROM's ExeFS must be
+        // passed in so an update NCA can replace it.
+        patched_exefs = pm.PatchExeFS(base_exefs);
+        update_exefs_applied = update_exefs != nullptr && patched_exefs != nullptr &&
+                               patched_exefs->GetFile("main") != nullptr;
+    } else if (update_exefs && update_exefs->GetFile("main")) {
+        patched_exefs = update_exefs;
+        update_exefs_applied = true;
+    } else {
+        patched_exefs = nullptr;
+    }
+
     patched_romfs =
         pm.PatchRomFS(base_program_nca.get(), base_romfs, ContentRecordType::Program);
+    if (!patched_romfs) {
+        patched_romfs = base_romfs;
+    }
 
     aoc.clear();
     for (const auto& entry :
@@ -160,8 +213,8 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
         held_aoc_ncas.push_back(std::move(aoc_nca));
     }
 
+    std::vector<ExportBakeItem> candidates;
     const auto patches = pm.GetPatches();
-    bake_items.clear();
     for (const auto& patch : patches) {
         if (!patch.enabled) {
             continue;
@@ -171,15 +224,16 @@ bool ExportContentSession::ApplyPatches(Core::System& system) {
             item.kind = ExportBakeItem::Kind::Update;
             item.name = patch.version.empty() ? patch.name : fmt::format("{} {}", patch.name, patch.version);
             item.source = SourceLabel(patch.source);
-            bake_items.push_back(std::move(item));
+            candidates.push_back(std::move(item));
         } else if (patch.type == PatchType::DLC) {
             ExportBakeItem item;
             item.kind = ExportBakeItem::Kind::Dlc;
             item.name = patch.version.empty() ? patch.name : fmt::format("{} {}", patch.name, patch.version);
             item.source = SourceLabel(patch.source);
-            bake_items.push_back(std::move(item));
+            candidates.push_back(std::move(item));
         }
     }
+    bake_items = FilterAppliedBakeItems(candidates, update_exefs_applied, aoc.size());
     status = FormatExportBakeStatus(bake_items);
     return true;
 }
@@ -192,7 +246,11 @@ bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequ
     patched_exefs = nullptr;
     patched_romfs = nullptr;
     base_program_nca.reset();
+    held_update_nca.reset();
     held_aoc_ncas.clear();
+    directory_exefs = nullptr;
+    directory_romfs = nullptr;
+    update_exefs_applied = false;
     title_id = request.title_id;
     status.clear();
 
@@ -263,10 +321,23 @@ bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequ
         return false;
     }
 
-    ApplyPatches(system);
+    if (!ApplyPatches(system)) {
+        if (error.empty()) {
+            error = "Failed to apply update/DLC patches";
+        }
+        if (status.empty()) {
+            status = FormatExportBakeStatus(bake_items);
+        }
+        return false;
+    }
 
     if (!failed_addon_paths.empty()) {
-        status += fmt::format(" {} extra file(s) could not be read.", failed_addon_paths.size());
+        error = FormatFailedAddonNote(failed_addon_paths.size());
+        if (!status.empty()) {
+            status += ' ';
+        }
+        status += error;
+        return false;
     }
     return true;
 }

@@ -72,6 +72,9 @@ public:
     [[nodiscard]] const std::vector<std::string>& GetFailedAddonPaths() const {
         return failed_addon_paths;
     }
+    [[nodiscard]] bool UpdateExeFSApplied() const {
+        return update_exefs_applied;
+    }
 
 private:
     bool RegisterPath(const std::string& path, bool is_base_rom);
@@ -82,9 +85,13 @@ private:
     std::unique_ptr<class ManualContentProvider> manual;
     std::unique_ptr<class ContentProviderUnion> overlay;
     std::unique_ptr<NCA> base_program_nca;
+    std::unique_ptr<NCA> held_update_nca;
     std::vector<std::unique_ptr<NCA>> held_aoc_ncas;
+    VirtualDir directory_exefs;
+    VirtualFile directory_romfs;
 
     u64 title_id{};
+    bool update_exefs_applied{false};
     VirtualDir patched_exefs;
     VirtualFile patched_romfs;
     std::vector<ExportBakeItem> bake_items;

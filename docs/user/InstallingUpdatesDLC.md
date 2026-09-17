@@ -65,4 +65,6 @@ This does not help you obtain dumps. Only use files you already own.
 4. The status line lists what will be baked (update version, DLC IDs, and source).
 5. Export as usual. The package's `exefs/` (including `romfs.bin`) is the **patched snapshot**. DLC is written under `aoc/<title id>/romfs.bin`.
 
+If an extra file cannot be read, export **stops** and reports the path — it does not package a base-only snapshot while claiming the add-on was baked. The status line only lists an update when ExeFS replace actually applied (directory dumps without a Program NCA are not described as patched).
+
 The standalone runtime does **not** need a post-export NAND install. Updates are already applied to ExeFS/RomFS; DLC is served from the baked `aoc/` tree. `content_baked.txt` in the package repeats the same summary.

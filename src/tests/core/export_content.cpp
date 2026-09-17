@@ -37,3 +37,46 @@ TEST_CASE("FormatExportBakeStatus describes baked addons", "[export]") {
     REQUIRE(status.find("picked file") != std::string::npos);
     REQUIRE(status.find("Standalone snapshot") != std::string::npos);
 }
+
+TEST_CASE("FilterAppliedBakeItems omits update unless ExeFS replace applied", "[export]") {
+    const std::vector<FileSys::ExportBakeItem> candidates{
+        {FileSys::ExportBakeItem::Kind::Update, "Update v1.0.0", "NAND"},
+        {FileSys::ExportBakeItem::Kind::Dlc, "DLC 1", "picked file"},
+    };
+
+    const auto lied = FileSys::FilterAppliedBakeItems(candidates, false, 0);
+    REQUIRE(lied.empty());
+
+    const auto update_only = FileSys::FilterAppliedBakeItems(candidates, true, 0);
+    REQUIRE(update_only.size() == 1);
+    REQUIRE(update_only[0].kind == FileSys::ExportBakeItem::Kind::Update);
+
+    const auto dlc_only = FileSys::FilterAppliedBakeItems(candidates, false, 1);
+    REQUIRE(dlc_only.size() == 1);
+    REQUIRE(dlc_only[0].kind == FileSys::ExportBakeItem::Kind::Dlc);
+
+    const auto both = FileSys::FilterAppliedBakeItems(candidates, true, 2);
+    REQUIRE(both.size() == 2);
+
+    const auto dumped_without_patch_list = FileSys::FilterAppliedBakeItems({}, false, 2);
+    REQUIRE(dumped_without_patch_list.size() == 1);
+    REQUIRE(dumped_without_patch_list[0].kind == FileSys::ExportBakeItem::Kind::Dlc);
+}
+
+TEST_CASE("FormatFailedAddonNote fails closed on unread extras", "[export]") {
+    REQUIRE(FileSys::FormatFailedAddonNote(0).empty());
+    const std::string note = FileSys::FormatFailedAddonNote(2);
+    REQUIRE(note.find("2 extra file") != std::string::npos);
+    REQUIRE(note.find("will not continue") != std::string::npos);
+}
+
+TEST_CASE("AOC Count and List agree on base title id including update NPDM", "[export]") {
+    constexpr u64 base = 0x0100AABBCCDDE000ULL;
+    constexpr u64 update_npdm = base | 0x800;
+    constexpr u64 aoc = FileSys::GetAOCBaseTitleID(base) + 4;
+
+    REQUIRE(FileSys::GetBaseTitleID(update_npdm) == base);
+    REQUIRE(FileSys::GetBaseTitleID(aoc) == FileSys::GetBaseTitleID(update_npdm));
+    REQUIRE(FileSys::ClassifyTitleRelation(FileSys::GetBaseTitleID(update_npdm), aoc) ==
+            FileSys::TitleRelation::Aoc);
+}
