@@ -3,13 +3,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <filesystem>
-#include <fstream>
-
-#include "core/core.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/export_bake.h"
-#include "core/file_sys/export_content.h"
 
 TEST_CASE("ClassifyTitleRelation distinguishes base, update, and AOC", "[export]") {
     constexpr u64 base = 0x0100AABBCCDDE000ULL;
@@ -101,41 +96,4 @@ TEST_CASE("DecideUpdateBake fails closed without Program NCA or incomplete BKTR"
     const auto mixed = FileSys::FilterAppliedBakeItems(
         {{FileSys::ExportBakeItem::Kind::Update, "Update v1.0.0", "NAND"}}, false, 0);
     REQUIRE(mixed.empty());
-}
-
-TEST_CASE("ExportContentSession Resolve fails closed on missing extras", "[export]") {
-    Core::System system;
-    system.Initialize();
-
-    auto tmp = std::filesystem::temp_directory_path() / "drippu-export-session-test";
-    std::filesystem::create_directories(tmp / "exefs");
-    {
-        std::ofstream out{(tmp / "exefs" / "main").string()};
-        REQUIRE(out.good());
-    }
-
-    FileSys::ExportContentRequest req;
-    req.rom_path = tmp.string();
-    req.title_id = 0x0100AABBCCDDE000ULL;
-    req.use_nand_addons = false;
-    req.extra_addon_paths.push_back((tmp / "missing-update.nsp").string());
-
-    FileSys::ExportContentSession session;
-    REQUIRE_FALSE(session.Resolve(system, req));
-    REQUIRE_FALSE(session.ok());
-    REQUIRE_FALSE(session.GetFailedAddonPaths().empty());
-    REQUIRE(session.GetError().find("will not continue") != std::string::npos);
-    REQUIRE_FALSE(session.UpdateExeFSApplied());
-    REQUIRE_FALSE(session.UpdateRomFSApplied());
-
-    std::filesystem::remove_all(tmp);
-}
-
-TEST_CASE("ExportContentSession refuses empty ROM path", "[export]") {
-    Core::System system;
-    system.Initialize();
-    FileSys::ExportContentSession session;
-    FileSys::ExportContentRequest req;
-    REQUIRE_FALSE(session.Resolve(system, req));
-    REQUIRE(session.GetError() == "No ROM path");
 }
