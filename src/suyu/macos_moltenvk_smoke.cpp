@@ -1,26 +1,39 @@
 // SPDX-FileCopyrightText: 2026 drippu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Headless-enough Apple smoke: create a Qt VulkanSurface window, attach a
-// CAMetalLayer via the live suyu GetWindowSystemInfo path, then create a
-// MoltenVK instance and metal surface. Does not boot a game.
+// Apple Silicon smoke of the live Qt Vulkan path:
+// QApplication + VulkanRenderWidget / InitRenderTarget WSI snapshot before
+// addWidget, then RendererVulkan's CreateDevice + swapchain on that surface.
+// MoltenVK is loaded from suyu.app Contents/Frameworks (no LIBVULKAN_PATH).
+// Does not boot a game.
 
 #include <cstdlib>
+#include <exception>
+#include <filesystem>
 #include <iostream>
 #include <string>
-#include <vector>
 
-#include <QGuiApplication>
+#include <QApplication>
+#include <QHBoxLayout>
+#include <QPaintEngine>
 #include <QStringLiteral>
+#include <QWidget>
 #include <QWindow>
 
+#include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "core/frontend/emu_window.h"
+#include "core/frontend/framebuffer_layout.h"
 #include "suyu/qt_common.h"
+#include "video_core/renderer_vulkan/renderer_vulkan.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "vulkan/vulkan_core.h"
 
 namespace {
 
@@ -29,74 +42,109 @@ void Fail(const std::string& why) {
     std::exit(1);
 }
 
+// Mirrors bootmanager.cpp RenderWidget / VulkanRenderWidget.
+class RenderWidget : public QWidget {
+public:
+    explicit RenderWidget(QWidget* parent) : QWidget(parent) {
+        setAttribute(Qt::WA_NativeWindow);
+        setAttribute(Qt::WA_PaintOnScreen);
+        if (QtCommon::GetWindowSystemType() == Core::Frontend::WindowSystemType::Wayland) {
+            setAttribute(Qt::WA_DontCreateNativeAncestors);
+        }
+    }
+
+    QPaintEngine* paintEngine() const override {
+        return nullptr;
+    }
+};
+
+class VulkanRenderWidget : public RenderWidget {
+public:
+    explicit VulkanRenderWidget(QWidget* parent) : RenderWidget(parent) {
+        windowHandle()->setSurfaceType(QWindow::VulkanSurface);
+    }
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef __APPLE__
+    unsetenv("LIBVULKAN_PATH");
+#endif
+
     Common::Log::Initialize();
     Common::Log::Start();
     Common::Log::SetColorConsoleBackendEnabled(true);
 
-    QGuiApplication app(argc, argv);
-    QWindow window;
-    window.setTitle(QStringLiteral("macos_moltenvk_smoke"));
-    window.resize(64, 64);
-    window.setSurfaceType(QWindow::VulkanSurface);
-    window.show();
-    if (!window.create()) {
-        Fail("QWindow::create failed");
+    const auto bundle = Common::FS::GetBundleDirectory();
+    const auto moltenvk = bundle / "Contents/Frameworks/libMoltenVK.dylib";
+    std::cout << "macos_moltenvk_smoke: bundle=" << bundle.string() << '\n';
+    if (!std::filesystem::exists(moltenvk)) {
+        Fail("MoltenVK missing from app Frameworks at " + moltenvk.string());
     }
-    QGuiApplication::processEvents();
+    std::cout << "macos_moltenvk_smoke: moltenvk=" << moltenvk.string() << '\n';
 
-    const auto wsi = QtCommon::GetWindowSystemInfo(&window);
+    QApplication app(argc, argv);
+
+    QWidget host;
+    host.setWindowTitle(QStringLiteral("macos_moltenvk_smoke"));
+    auto* layout = new QHBoxLayout(&host);
+    layout->setContentsMargins(0, 0, 0, 0);
+    host.show();
+    QApplication::processEvents();
+
+    // InitRenderTarget: dummy widget so Qt places the render window, then Vulkan.
+    {
+        const RenderWidget dummy_widget{&host};
+    }
+
+    auto* child = new VulkanRenderWidget(&host);
+    if (!child->windowHandle()) {
+        Fail("VulkanRenderWidget has no QWindow");
+    }
+    // Qt 6: QWindow::create() is void (same as bootmanager InitializeVulkan).
+    child->windowHandle()->create();
+    QApplication::processEvents();
+
+    // Live WSI snapshot is taken before addWidget (InitRenderTarget order).
+    const auto wsi = QtCommon::GetWindowSystemInfo(child->windowHandle());
+    child->resize(Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height);
+    layout->addWidget(child);
+    host.resize(Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height);
+    QApplication::processEvents();
+
     if (wsi.type != Core::Frontend::WindowSystemType::Cocoa) {
         Fail("window system is not Cocoa");
     }
     if (wsi.render_surface == nullptr) {
-        Fail("GetWindowSystemInfo returned a null CAMetalLayer");
+        Fail("GetWindowSystemInfo returned a null CAMetalLayer (before addWidget)");
     }
     std::cout << "macos_moltenvk_smoke: CAMetalLayer ok\n";
 
     try {
         Vulkan::vk::InstanceDispatch dld;
         const auto library = Vulkan::OpenLibrary();
+        if (!library || !library->IsOpen()) {
+            Fail("OpenLibrary did not load MoltenVK from suyu.app Frameworks");
+        }
         const Vulkan::vk::Instance instance =
             Vulkan::CreateInstance(*library, dld, VK_API_VERSION_1_1, wsi.type);
         const Vulkan::vk::SurfaceKHR surface = Vulkan::CreateSurface(instance, wsi);
         std::cout << "macos_moltenvk_smoke: Vulkan surface ok\n";
 
-        const std::vector<VkPhysicalDevice> physical_devices = instance.EnumeratePhysicalDevices();
-        if (physical_devices.empty()) {
-            Fail("no Vulkan physical devices");
+        Vulkan::Device device = Vulkan::CreateDevice(instance, dld, *surface);
+        if (!device.IsMoltenVK()) {
+            Fail("CreateDevice did not select MoltenVK (driver=" + device.GetDriverName() + ")");
         }
+        std::cout << "macos_moltenvk_smoke: driver=MoltenVK\n";
+        std::cout << "macos_moltenvk_smoke: device ok\n";
 
-        bool found_moltenvk = false;
-        for (const VkPhysicalDevice device : physical_devices) {
-            const auto physical = Vulkan::vk::PhysicalDevice(device, dld);
-            VkPhysicalDeviceDriverProperties driver_properties{};
-            driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-            VkPhysicalDeviceProperties2 properties{};
-            properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-            properties.pNext = &driver_properties;
-            if (!dld.vkGetPhysicalDeviceProperties2) {
-                Fail("vkGetPhysicalDeviceProperties2 is null");
-            }
-            dld.vkGetPhysicalDeviceProperties2(physical, &properties);
-
-            const std::string driver_name = Vulkan::vk::GetDriverName(driver_properties);
-            const std::string device_name = properties.properties.deviceName;
-            std::cout << "macos_moltenvk_smoke: device=" << device_name
-                      << " driver=" << driver_name << '\n';
-
-            if (driver_properties.driverID == VK_DRIVER_ID_MOLTENVK ||
-                driver_name.find("MoltenVK") != std::string::npos) {
-                found_moltenvk = true;
-                std::cout << "macos_moltenvk_smoke: driver=MoltenVK\n";
-            }
-        }
-
-        if (!found_moltenvk) {
-            Fail("no MoltenVK physical device");
-        }
+        Vulkan::StateTracker state_tracker;
+        Vulkan::Scheduler scheduler(device, state_tracker);
+        Vulkan::Swapchain swapchain(*surface, device, scheduler, Layout::ScreenUndocked::Width,
+                                    Layout::ScreenUndocked::Height);
+        std::cout << "macos_moltenvk_smoke: swapchain ok\n";
+        void(device.GetLogical().WaitIdle());
     } catch (const Vulkan::vk::Exception& exception) {
         Fail(std::string("Vulkan: ") + exception.what());
     } catch (const std::exception& exception) {

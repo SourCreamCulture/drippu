@@ -605,7 +605,7 @@ endif()
 create_target_directory_groups(suyu)
 
 if (APPLE)
-    # PR CI smoke: live Qt GetWindowSystemInfo + MoltenVK metal surface.
+    # PR CI smoke: live Qt VulkanRenderWidget WSI + MoltenVK device/swapchain.
     add_executable(macos_moltenvk_smoke
         macos_moltenvk_smoke.cpp
         qt_common.cpp
@@ -615,7 +615,7 @@ if (APPLE)
     target_link_libraries(macos_moltenvk_smoke PRIVATE
         common
         video_core
-        Qt${QT_MAJOR_VERSION}::Gui
+        Qt${QT_MAJOR_VERSION}::Widgets
         Vulkan::Headers
         ${PLATFORM_LIBRARIES}
         ${QUARTZCORE_LIBRARY}
@@ -626,5 +626,12 @@ if (APPLE)
     target_compile_definitions(macos_moltenvk_smoke PRIVATE
         QT_NO_CAST_FROM_ASCII
         QT_NO_CAST_TO_ASCII
+    )
+    add_dependencies(macos_moltenvk_smoke suyu)
+    add_custom_command(TARGET macos_moltenvk_smoke POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE:macos_moltenvk_smoke>
+            $<TARGET_FILE_DIR:suyu>/macos_moltenvk_smoke
+        COMMENT "Install macos_moltenvk_smoke into suyu.app so OpenLibrary sees Frameworks/MoltenVK"
     )
 endif()

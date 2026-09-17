@@ -116,11 +116,14 @@ copies the Qt bundle to `drippu.app`.
 MoltenVK comes from the bundled CPM package (`V380-Ori/Ryujinx.MoltenVK`,
 `v1.4.1-ryujinx`) by default (`YUZU_USE_BUNDLED_MOLTENVK=ON` on Apple). It is
 copied into `suyu.app/Contents/Frameworks/`, and that is the copy
-`Vulkan::OpenLibrary` loads: it tries `LIBVULKAN_PATH`, then the bundle's
-`libvulkan.1.dylib` and `libMoltenVK.dylib`. The app therefore does not need
-MoltenVK installed. Pass `-DYUZU_USE_BUNDLED_MOLTENVK=OFF` to prefer an
-installed copy (Homebrew `molten-vk`); GitHub Actions `release.yml` `build-macos`
-and the PR `macos-moltenvk-smoke` job use that so they can `brew install molten-vk`.
+`Vulkan::OpenLibrary` loads: it tries `LIBVULKAN_PATH` (unset for the app
+default), then the bundle's `libvulkan.1.dylib` and `libMoltenVK.dylib`. The
+app therefore does not need MoltenVK installed. Pass
+`-DYUZU_USE_BUNDLED_MOLTENVK=OFF` to prefer an installed copy (Homebrew
+`molten-vk`). GitHub Actions `release.yml` `build-macos` uses OFF + brew so the
+scheduled artifact can ship Homebrew's dylib; the PR `macos-moltenvk-smoke` job
+uses ON (the documented local default) and runs the smoke from inside
+`suyu.app` with `LIBVULKAN_PATH` unset.
 
 `suyu-cmd` / `drippu-cmd` sit next to the bundle, not inside it, so they do not
 see `Contents/Frameworks` unless you export `LIBVULKAN_PATH` to a

@@ -1,6 +1,7 @@
 name: macOS MoltenVK smoke
 
-# Apple Silicon PR coverage for the live Qt CAMetalLayer + MoltenVK init path.
+# Apple Silicon PR coverage for the live Qt VulkanRenderWidget path and
+# MoltenVK loaded from suyu.app Frameworks (bundled CPM default).
 # Linux tests.yml is ENABLE_QT=OFF and is not this coverage.
 
 on:
@@ -30,14 +31,14 @@ jobs:
             printf '// Forwarding header\n#include <boost/variant/variant.hpp>\n#include <boost/variant/recursive_variant.hpp>\n#include <boost/variant/recursive_wrapper.hpp>\n#include <boost/variant/get.hpp>\n#include <boost/variant/apply_visitor.hpp>\n#include <boost/variant/static_visitor.hpp>\n#include <boost/variant/visitor_ptr.hpp>\n' > "$f"
           fi
       - name: Install deps
-        run: brew install ninja qt@6 openssl ffmpeg glslang molten-vk boost
+        run: brew install ninja qt@6 openssl ffmpeg glslang boost
       - name: Configure
         run: |
           cmake --version
           cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF -GNinja \
             -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix openssl);$(brew --prefix ffmpeg)" \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
-            -DYUZU_USE_BUNDLED_MOLTENVK=OFF 2>&1 | tee cmake_configure.log
+            -DYUZU_USE_BUNDLED_MOLTENVK=ON 2>&1 | tee cmake_configure.log
           test ${PIPESTATUS[0]} -eq 0
       - name: Upload cmake log
         if: failure()
@@ -48,7 +49,7 @@ jobs:
       - name: Build
         run: cmake --build build --target suyu suyu-cmd macos_moltenvk_smoke -j4
       - name: Run MoltenVK / CAMetalLayer smoke
-        timeout-minutes: 3
+        timeout-minutes: 5
         env:
           QT_QPA_PLATFORM: cocoa
           XDG_DATA_HOME: ${{ runner.temp }}/suyu-smoke/share
@@ -56,22 +57,23 @@ jobs:
           XDG_CACHE_HOME: ${{ runner.temp }}/suyu-smoke/cache
         run: |
           set -euo pipefail
-          MVK=""
-          if [ -f build/bin/suyu.app/Contents/Frameworks/libMoltenVK.dylib ]; then
-            MVK="$PWD/build/bin/suyu.app/Contents/Frameworks/libMoltenVK.dylib"
-          elif [ -f "$(brew --prefix molten-vk)/lib/libMoltenVK.dylib" ]; then
-            MVK="$(brew --prefix molten-vk)/lib/libMoltenVK.dylib"
-          else
-            echo "libMoltenVK.dylib not found in suyu.app or Homebrew"
-            exit 1
-          fi
-          export LIBVULKAN_PATH="$MVK"
-          echo "LIBVULKAN_PATH=$LIBVULKAN_PATH"
-          ls -l "$LIBVULKAN_PATH"
-          ./build/bin/macos_moltenvk_smoke 2>&1 | tee macos-moltenvk-smoke.log
+          unset LIBVULKAN_PATH || true
+          APP="build/bin/suyu.app"
+          MVK="$APP/Contents/Frameworks/libMoltenVK.dylib"
+          SMOKE="$APP/Contents/MacOS/macos_moltenvk_smoke"
+          test -d "$APP"
+          test -f "$MVK"
+          test -x "$SMOKE"
+          echo "bundle MoltenVK: $MVK"
+          ls -l "$MVK" "$SMOKE"
+          # Run from inside suyu.app so CFBundleGetMainBundle / OpenLibrary
+          # load Contents/Frameworks, matching the Qt app.
+          "$SMOKE" 2>&1 | tee macos-moltenvk-smoke.log
           grep -F "macos_moltenvk_smoke: CAMetalLayer ok" macos-moltenvk-smoke.log
           grep -F "macos_moltenvk_smoke: Vulkan surface ok" macos-moltenvk-smoke.log
           grep -F "macos_moltenvk_smoke: driver=MoltenVK" macos-moltenvk-smoke.log
+          grep -F "macos_moltenvk_smoke: device ok" macos-moltenvk-smoke.log
+          grep -F "macos_moltenvk_smoke: swapchain ok" macos-moltenvk-smoke.log
           grep -F "macos_moltenvk_smoke: OK" macos-moltenvk-smoke.log
           if grep -F "macos_moltenvk_smoke: FAIL" macos-moltenvk-smoke.log; then
             exit 1
