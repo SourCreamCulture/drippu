@@ -481,7 +481,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         std::string s = "{ uint64_t _r = " + expr + "; ";
         if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
         if (rd != 31) s += "c->x[" + std::to_string(rd) + "] = _r; ";
-        if (opc == 3) s += "recomp_set_flags(c,0,_r,0,_r," + std::string(sf ? "1" : "0") + "); ";
+        if (opc == 3) {
+            // ANDS/BICS/TST: N and Z from the result. V is unchanged. C is the
+            // shifter carry; imm6==0 means the shifter did not operate so C is
+            // also unchanged. recomp_set_flags(add, _r, 0, _r) used to force
+            // C=V=0, which disagrees with Dynarmic and the ARM ARM.
+            const char* sign = sf ? "0x8000000000000000ULL" : "0x80000000ULL";
+            s += "c->z=(_r==0); c->n=(_r&" + std::string(sign) + ")?1:0; ";
+        }
         s += "}";
         put(s);
         return true;
@@ -674,7 +681,10 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // for ANDS (opc==3). Treating it as XZR everywhere silently
             // dropped every "and sp, xN, #imm" stack realignment.
             if (!(rd == 31 && opc == 3)) s += "c->x[" + std::to_string(rd) + "] = _r; ";
-            if (opc == 3) s += "recomp_set_flags(c,0,_r,0,_r," + std::string(sf ? "1" : "0") + "); ";
+            if (opc == 3) {
+                const char* sign = sf ? "0x8000000000000000ULL" : "0x80000000ULL";
+                s += "c->z=(_r==0); c->n=(_r&" + std::string(sign) + ")?1:0; ";
+            }
             s += "}";
             put(s);
             return true;
