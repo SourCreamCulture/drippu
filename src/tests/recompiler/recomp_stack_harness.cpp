@@ -13,13 +13,18 @@
 // (force-miss → Dynarmic). Slice times are host RunThread durations (no GPU
 // frames in this harness). Results: recomp_benchmark.json.
 //
+// The bench ADD chain is punctuated with STR/LDR of x0 through the opaque
+// host_mem callbacks so Release (-O3) cannot strength-reduce 512 ADDs to
+// `x1 << 9`. objdump of block_bench must not look like a single shift.
+//
 // Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
 // safe live HLE). Does not load copyrighted titles or keys.
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <cstdint>
+#include <cctype>
+#include <cstdio>
+#include <regex>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -155,12 +160,14 @@ constexpr u64 kOffAotProof = 0x1400;
 constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
 constexpr u64 kOffStepNoSvc = 0x1C00; // MOVZ #7 only — leftover pending_svc pin
 constexpr u64 kOffCrossPage = 0x1FFC;
-// Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003). 514 insns * 4 = 0x808.
+// Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003).
+// 512 × (STR + LDR + ADD) + MOVZ + SVC = 1538 insns = 0x1810 bytes.
 constexpr u64 kOffBench = 0x2400;
 constexpr int kBenchAdds = 512;
 constexpr u32 kBenchSvcImm = 3;
-constexpr u64 kCodeBytes = 3 * Kernel::PageSize;
-constexpr u64 kImageBytes = 4 * Kernel::PageSize;
+constexpr u64 kCodeBytes = 4 * Kernel::PageSize;
+constexpr u64 kImageBytes = 5 * Kernel::PageSize;
+constexpr u64 kOffBenchScratch = kCodeBytes; // data-segment word STR/LDR bounce
 
 // AArch64 encodings (also written into guest RX).
 constexpr u32 kMovzX0_1234 = 0xD2824680u;
@@ -178,7 +185,9 @@ constexpr u32 kSvc77 = 0xD40009A1u;
 constexpr u32 kMovzX0_7 = 0xD28000E0u;
 constexpr u32 kSvc1 = 0xD4000021u;
 constexpr u32 kMovzX0_0 = 0xD2800000u;
-constexpr u32 kAddX0X0X1 = 0x8B010000u; // ADD X0, X0, X1 — not foldable by the AOT C compiler
+constexpr u32 kAddX0X0X1 = 0x8B010000u; // ADD X0, X0, X1
+constexpr u32 kStrX0X3 = 0xF9000060u;   // STR X0, [X3] — opaque store breaks x0 recurrence
+constexpr u32 kLdrX0X3 = 0xF9400060u;   // LDR X0, [X3]
 constexpr u32 kSvc3 = 0xD4000061u;      // SVC #3
 
 u64 g_entry = 0;
@@ -209,6 +218,12 @@ struct AotCompileCosts {
     u64 so_bytes{};
     u64 bench_c_bytes{};
     std::string so_path;
+    u64 disasm_add_count{};
+    u64 disasm_shl9_count{};
+    u64 disasm_imul512_count{};
+    u64 disasm_backward_jumps{};
+    bool not_single_shift{};
+    std::string disasm_excerpt;
 };
 AotCompileCosts g_aot_compile;
 
@@ -221,11 +236,17 @@ u64 NsSince(std::chrono::steady_clock::time_point t0) {
 
 std::vector<std::pair<u64, u32>> BenchInsns() {
     std::vector<std::pair<u64, u32>> v;
-    v.reserve(static_cast<size_t>(kBenchAdds) + 2);
+    v.reserve(static_cast<size_t>(kBenchAdds) * 3 + 2);
     u64 off = kOffBench;
     v.emplace_back(off, kMovzX0_0);
     off += 4;
     for (int i = 0; i < kBenchAdds; ++i) {
+        // STR/LDR of x0 through recomp_store/load (function pointers) so -O3
+        // cannot treat the ADD chain as a loop-invariant `x1 << 9`.
+        v.emplace_back(off, kStrX0X3);
+        off += 4;
+        v.emplace_back(off, kLdrX0X3);
+        off += 4;
         v.emplace_back(off, kAddX0X0X1);
         off += 4;
     }
@@ -287,6 +308,145 @@ std::string HostCpu() {
 #endif
     return {};
 }
+
+#ifndef _WIN32
+std::string PopenDump(const std::string& cmd) {
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) {
+        return {};
+    }
+    std::string out;
+    char buf[4096];
+    while (std::fgets(buf, sizeof buf, p)) {
+        out.append(buf);
+    }
+    pclose(p);
+    return out;
+}
+
+std::string ExtractObjdumpFn(const std::string& dump, const char* name) {
+    const std::string tag = std::string("<") + name + ">:";
+    const auto tag_at = dump.find(tag);
+    if (tag_at == std::string::npos) {
+        return {};
+    }
+    const auto line_start = dump.rfind('\n', tag_at);
+    const auto from = line_start == std::string::npos ? 0 : line_start + 1;
+    static const std::regex next_fn("\n[0-9A-Fa-f]+ <[^>]+>:");
+    std::smatch m;
+    const std::string rest = dump.substr(tag_at + tag.size());
+    if (std::regex_search(rest, m, next_fn)) {
+        return dump.substr(from, (tag_at + tag.size() + static_cast<size_t>(m.position())) - from);
+    }
+    return dump.substr(from);
+}
+
+struct DisasmCounts {
+    u64 add{};
+    u64 shl9{};
+    u64 imul512{};
+    u64 backward_jumps{};
+    u64 call{};
+};
+
+DisasmCounts CountBlockBenchOps(const std::string& fn) {
+    DisasmCounts c;
+    std::istringstream in(fn);
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        u64 addr = 0;
+        addr = std::strtoull(line.c_str(), nullptr, 16);
+        // Mnemonic sits after the last tab (GNU objdump: addr:\tbytes\tmnemonic).
+        const auto tab = line.rfind('\t');
+        if (tab == std::string::npos) {
+            continue;
+        }
+        std::string rest = line.substr(tab + 1);
+        while (!rest.empty() && std::isspace(static_cast<unsigned char>(rest.front()))) {
+            rest.erase(rest.begin());
+        }
+        auto first = rest.find(' ');
+        const std::string mnem = first == std::string::npos ? rest : rest.substr(0, first);
+        const std::string args = first == std::string::npos ? std::string{} : rest.substr(first);
+        if (mnem == "add" || mnem == "addq") {
+            if (args.find("%rsp") == std::string::npos && args.find("%rbp") == std::string::npos) {
+                ++c.add;
+            }
+        } else if (mnem == "shl" || mnem == "shlq" || mnem == "sal" || mnem == "salq") {
+            if (args.find("$0x9,") != std::string::npos || args.find("$9,") != std::string::npos ||
+                args.find("$0x9 ") != std::string::npos || args.find("$9 ") != std::string::npos) {
+                ++c.shl9;
+            }
+        } else if (mnem == "imul" || mnem == "imulq") {
+            if (args.find("$0x200") != std::string::npos || args.find("$512") != std::string::npos) {
+                ++c.imul512;
+            }
+        } else if (mnem == "call" || mnem == "callq") {
+            ++c.call;
+        } else if (!mnem.empty() && mnem[0] == 'j') {
+            u64 target = 0;
+            size_t t = 0;
+            while (t < args.size() && std::isspace(static_cast<unsigned char>(args[t]))) {
+                ++t;
+            }
+            if (t < args.size()) {
+                target = std::strtoull(args.c_str() + t, nullptr, 16);
+            }
+            if (addr != 0 && target != 0 && target < addr) {
+                ++c.backward_jumps;
+            }
+        }
+    }
+    return c;
+}
+
+void PinAotBenchNotFolded(const fs::path& so) {
+    const std::string cmd = "objdump -d " + Quote(so.string()) + " 2>/dev/null";
+    const std::string dump = PopenDump(cmd);
+    if (dump.empty()) {
+        Fail("objdump -d of AOT .so produced no output (objdump required to pin no x1<<9 fold)");
+        return;
+    }
+    const std::string fn = ExtractObjdumpFn(dump, "block_bench");
+    if (fn.empty()) {
+        Fail("objdump missing <block_bench> in " + so.string());
+        return;
+    }
+    const DisasmCounts n = CountBlockBenchOps(fn);
+    g_aot_compile.disasm_add_count = n.add;
+    g_aot_compile.disasm_shl9_count = n.shl9;
+    g_aot_compile.disasm_imul512_count = n.imul512;
+    g_aot_compile.disasm_backward_jumps = n.backward_jumps;
+    std::istringstream lines(fn);
+    std::string line;
+    int kept = 0;
+    std::ostringstream excerpt;
+    while (std::getline(lines, line) && kept < 40) {
+        excerpt << line << '\n';
+        ++kept;
+    }
+    g_aot_compile.disasm_excerpt = excerpt.str();
+
+    const bool folded_to_shift =
+        (n.shl9 > 0 || n.imul512 > 0) && n.add < 8 && n.backward_jumps == 0;
+    const bool honest_unroll = n.add >= static_cast<u64>(kBenchAdds / 4);
+    const bool honest_loop = n.backward_jumps >= 1 && n.add >= 1;
+    g_aot_compile.not_single_shift = !folded_to_shift && (honest_unroll || honest_loop);
+
+    std::cout << "AOT block_bench objdump: add=" << n.add << " shl9=" << n.shl9
+              << " imul512=" << n.imul512 << " back_jcc=" << n.backward_jumps
+              << " call=" << n.call << "\n";
+    if (!g_aot_compile.not_single_shift) {
+        Fail("AOT block_bench was host-folded (x1<<9 / imul 512), not 512 adds; dump:\n" + fn);
+        return;
+    }
+    ExpectTrue("AOT block_bench is not a single x1<<9", g_aot_compile.not_single_shift);
+}
+#endif
 
 Core::ArmRecomp* AsRecomp(Core::ArmInterface* iface) {
     if (!iface || !iface->IsRecompBackend()) {
@@ -481,6 +641,20 @@ bool BuildAndLoadAot(const fs::path& root) {
     const auto t_translate = std::chrono::steady_clock::now();
     const std::string aot_src = BuildAotSource();
     g_aot_compile.translate_ns = NsSince(t_translate);
+    {
+        const auto count = [&](std::string_view needle) {
+            u64 n = 0;
+            for (size_t p = 0; (p = aot_src.find(needle, p)) != std::string::npos;
+                 p += needle.size()) {
+                ++n;
+            }
+            return n;
+        };
+        ExpectTrue("bench C emits 512 recomp_store64 (not add-only)",
+                   count("recomp_store64") >= static_cast<u64>(kBenchAdds));
+        ExpectTrue("bench C emits 512 recomp_load64 (x0 reload)",
+                   count("recomp_load64") >= static_cast<u64>(kBenchAdds));
+    }
     if (!WriteFile(src_dir / "blocks.c", aot_src)) {
         return false;
     }
@@ -492,7 +666,11 @@ bool BuildAndLoadAot(const fs::path& root) {
                    "add_library(stack_aot SHARED blocks.c)\n"
                    "set_target_properties(stack_aot PROPERTIES\n"
                    "  POSITION_INDEPENDENT_CODE ON\n"
-                   "  C_VISIBILITY_PRESET default)\n")) {
+                   "  C_VISIBILITY_PRESET default)\n"
+                   "if (CMAKE_C_COMPILER_ID MATCHES \"GNU|Clang\")\n"
+                   "  target_compile_options(stack_aot PRIVATE\n"
+                   "    $<$<CONFIG:Release>:-O3>)\n"
+                   "endif()\n")) {
         return false;
     }
 
@@ -542,6 +720,7 @@ bool BuildAndLoadAot(const fs::path& root) {
     }
     g_aot_compile.so_bytes = static_cast<u64>(sz);
     g_aot_compile.so_path = so.string();
+    PinAotBenchNotFolded(so);
 
     const auto t_dl = std::chrono::steady_clock::now();
     g_so = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -1202,7 +1381,8 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
         auto& ctx = f.thread->GetContext();
         ctx = {};
         ctx.pc = g_entry + kOffBench;
-        ctx.r[1] = 1; // ADD X0, X0, X1 — keeps AOT C from constant-folding 512
+        ctx.r[1] = 1;
+        ctx.r[3] = g_entry + kOffBenchScratch;
         f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -1311,14 +1491,19 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
                    "around that mode's slices, not the mixed-scenario recomp_execution.json."}}},
         {"host", {{"cpu", HostCpu()}, {"rss_sampler", "/proc/self/status VmRSS/VmHWM/VmSize (kB)"}}},
         {"workload",
-         {{"name", "alu_add_svc"},
+         {{"name", "alu_add_reload_svc"},
           {"identical_across_backends", true},
+          {"anti_fold",
+           "each ADD is preceded by STR/LDR of x0 through host_mem function pointers "
+           "so -O3 cannot reduce 512 ADDs to x1<<9"},
           {"guest_pc_offset", "0x2400"},
           {"entry_pc", entry_pc.str()},
-          {"guest_instruction_count", kBenchAdds + 2},
+          {"guest_instruction_count", kBenchAdds * 3 + 2},
           {"encodings",
            nlohmann::json::array({
                {{"asm", "movz x0, #0"}, {"encoding", "0xD2800000"}},
+               {{"asm", "str x0, [x3]"}, {"encoding", "0xF9000060"}, {"repeat", kBenchAdds}},
+               {{"asm", "ldr x0, [x3]"}, {"encoding", "0xF9400060"}, {"repeat", kBenchAdds}},
                {{"asm", "add x0, x0, x1"},
                 {"encoding", "0x8B010000"},
                 {"repeat", kBenchAdds},
@@ -1336,7 +1521,15 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"dlopen_ns", g_aot_compile.dlopen_ns},
           {"so_bytes", g_aot_compile.so_bytes},
           {"so_path", g_aot_compile.so_path},
-          {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes}}},
+          {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes},
+          {"host_opt_check",
+           {{"method", "objdump -d <block_bench>"},
+            {"add_mnemonics", g_aot_compile.disasm_add_count},
+            {"shift_by_9", g_aot_compile.disasm_shl9_count},
+            {"imul_512", g_aot_compile.disasm_imul512_count},
+            {"backward_jumps", g_aot_compile.disasm_backward_jumps},
+            {"not_single_shift", g_aot_compile.not_single_shift},
+            {"excerpt", g_aot_compile.disasm_excerpt}}}}},
         {"modes", {{"hybrid_aot", ModeToJson(aot)}, {"jit", ModeToJson(jit)}}},
     };
 
@@ -1365,7 +1558,8 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
                json.find("\"schema_version\": 1") != std::string::npos);
     ExpectTrue("bench JSON hybrid_aot mode", json.find("\"hybrid_aot\"") != std::string::npos);
     ExpectTrue("bench JSON jit mode", json.find("\"jit\"") != std::string::npos);
-    ExpectTrue("bench JSON so_bytes", json.find("\"so_bytes\"") != std::string::npos);
+    ExpectTrue("bench JSON not_single_shift",
+               json.find("\"not_single_shift\": true") != std::string::npos);
     std::cout << "recomp_benchmark.json path: " << path << "\n";
     std::cout << "=== recomp_benchmark.json ===\n" << json << std::endl;
     ScenarioPass("JIT vs hybrid AOT benchmark JSON from identical guest fixture", before);
@@ -1385,12 +1579,17 @@ void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
                Lookup(g_entry + kOffBench) == g_block_bench && g_block_bench != nullptr);
     ExpectEq("bench guest RX movz", f.system.ApplicationMemory().Read32(g_entry + kOffBench),
              kMovzX0_0);
-    ExpectEq("bench guest RX add", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 4),
+    ExpectEq("bench guest RX str", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 4),
+             kStrX0X3);
+    ExpectEq("bench guest RX ldr", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 8),
+             kLdrX0X3);
+    ExpectEq("bench guest RX add", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 12),
              kAddX0X0X1);
     ExpectEq("bench guest RX svc",
-             f.system.ApplicationMemory().Read32(g_entry + kOffBench +
-                                                 4ull * (static_cast<u64>(kBenchAdds) + 1)),
+             f.system.ApplicationMemory().Read32(g_entry + kOffBench + 4ull +
+                                                 12ull * static_cast<u64>(kBenchAdds)),
              kSvc3);
+    ExpectTrue("AOT .so not_single_shift (objdump pin)", g_aot_compile.not_single_shift);
 
     const int iters = BenchIters();
     std::cout << "bench iters=" << iters << " adds=" << kBenchAdds << " pc=" << std::hex
@@ -1429,6 +1628,7 @@ void PrintGaps() {
         << "  - GPU frame times (this harness has no renderer; slice = RunThread until SVC)\n"
         << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
         << "  - AOT .so size includes non-bench integration blocks\n"
+        << "  - Bench slice is ADD+STR+LDR (anti-fold), not a pure ALU stream\n"
         << "  - #4 instruction correctness, #5 compatibility, #6 opts, #7 release-gate\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
