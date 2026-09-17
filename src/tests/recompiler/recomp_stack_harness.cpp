@@ -8,9 +8,15 @@
 // shared library (SUYU_HOSTED_RECOMP helpers). Matching AArch64 bytes are
 // written into guest RX so Dynarmic fallback executes the same sites.
 //
+// Backlog #3: after the integration scenarios, the same guest fixture (same
+// encodings / same PCs) is raced under hybrid AOT (lookup hit) vs JIT
+// (force-miss → Dynarmic). Slice times are host RunThread durations (no GPU
+// frames in this harness). Results: recomp_benchmark.json.
+//
 // Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
 // safe live HLE). Does not load copyrighted titles or keys.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -18,8 +24,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -28,6 +36,8 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
+
+#include <nlohmann/json.hpp>
 
 #include "common/common_types.h"
 #include "common/settings.h"
@@ -145,6 +155,10 @@ constexpr u64 kOffAotProof = 0x1400;
 constexpr u64 kOffPlain = 0x1800; // icache / Translate MOVZ #7 (guest RX matches)
 constexpr u64 kOffStepNoSvc = 0x1C00; // MOVZ #7 only — leftover pending_svc pin
 constexpr u64 kOffCrossPage = 0x1FFC;
+// Past the 8-byte STR at kOffCrossPage (0x1FFC..0x2003). 514 insns * 4 = 0x808.
+constexpr u64 kOffBench = 0x2400;
+constexpr int kBenchAdds = 512;
+constexpr u32 kBenchSvcImm = 3;
 constexpr u64 kCodeBytes = 3 * Kernel::PageSize;
 constexpr u64 kImageBytes = 4 * Kernel::PageSize;
 
@@ -163,6 +177,9 @@ constexpr u32 kMovzX0Cafe = 0xD2800000u | (0xCAFEu << 5);
 constexpr u32 kSvc77 = 0xD40009A1u;
 constexpr u32 kMovzX0_7 = 0xD28000E0u;
 constexpr u32 kSvc1 = 0xD4000021u;
+constexpr u32 kMovzX0_0 = 0xD2800000u;
+constexpr u32 kAddX0X0X1 = 0x8B010000u; // ADD X0, X0, X1 — not foldable by the AOT C compiler
+constexpr u32 kSvc3 = 0xD4000061u;      // SVC #3
 
 u64 g_entry = 0;
 u64 g_force_miss_pc = 0;
@@ -179,8 +196,97 @@ BlockFn g_block_miss_park = nullptr;
 BlockFn g_block_aot_proof = nullptr;
 BlockFn g_block_plain = nullptr;
 BlockFn g_block_step_no_svc = nullptr;
+BlockFn g_block_bench = nullptr;
 SetBaseFn g_set_base = nullptr;
 void* g_so = nullptr;
+
+struct AotCompileCosts {
+    u64 translate_ns{};
+    u64 bench_translate_ns{};
+    u64 cmake_configure_ns{};
+    u64 cmake_build_ns{};
+    u64 dlopen_ns{};
+    u64 so_bytes{};
+    u64 bench_c_bytes{};
+    std::string so_path;
+};
+AotCompileCosts g_aot_compile;
+
+u64 NsSince(std::chrono::steady_clock::time_point t0) {
+    const auto raw =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    return raw > 0 ? static_cast<u64>(raw) : 0;
+}
+
+std::vector<std::pair<u64, u32>> BenchInsns() {
+    std::vector<std::pair<u64, u32>> v;
+    v.reserve(static_cast<size_t>(kBenchAdds) + 2);
+    u64 off = kOffBench;
+    v.emplace_back(off, kMovzX0_0);
+    off += 4;
+    for (int i = 0; i < kBenchAdds; ++i) {
+        v.emplace_back(off, kAddX0X0X1);
+        off += 4;
+    }
+    v.emplace_back(off, kSvc3);
+    return v;
+}
+
+int BenchIters() {
+    int n = 32;
+    if (const char* env = std::getenv("SUYU_RECOMP_BENCH_ITERS"); env && env[0] != '\0') {
+        n = std::atoi(env);
+    }
+    return n < 4 ? 4 : n;
+}
+
+struct MemSnap {
+    u64 vmrss_kb{};
+    u64 vmhwm_kb{};
+    u64 vmsize_kb{};
+};
+
+MemSnap ReadMem() {
+    MemSnap m;
+#ifndef _WIN32
+    std::ifstream in("/proc/self/status");
+    std::string line;
+    while (std::getline(in, line)) {
+        auto take = [&](const char* key, u64& dest) {
+            if (line.rfind(key, 0) != 0) {
+                return;
+            }
+            dest = static_cast<u64>(std::strtoull(line.c_str() + std::strlen(key), nullptr, 10));
+        };
+        take("VmRSS:", m.vmrss_kb);
+        take("VmHWM:", m.vmhwm_kb);
+        take("VmSize:", m.vmsize_kb);
+    }
+#endif
+    return m;
+}
+
+std::string HostCpu() {
+#ifndef _WIN32
+    std::ifstream in("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto pos = line.find("model name");
+        if (pos == 0) {
+            const auto colon = line.find(':');
+            if (colon != std::string::npos) {
+                std::string name = line.substr(colon + 1);
+                while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) {
+                    name.erase(name.begin());
+                }
+                return name;
+            }
+        }
+    }
+#endif
+    return {};
+}
 
 Core::ArmRecomp* AsRecomp(Core::ArmInterface* iface) {
     if (!iface || !iface->IsRecompBackend()) {
@@ -218,6 +324,9 @@ Core::RecompBlockFn Lookup(u64 pc) {
     }
     if (pc == g_entry + kOffStepNoSvc) {
         return g_block_step_no_svc;
+    }
+    if (pc == g_entry + kOffBench) {
+        return g_block_bench;
     }
     return nullptr;
 }
@@ -334,6 +443,30 @@ void block_step_no_svc(GuestContext* c) {
     src << "    c->pc = g_module_base + 0x" << std::hex << (kOffStepNoSvc + 4) << std::dec
         << "ULL;\n";
     src << R"C(}
+
+void block_bench(GuestContext* c) {
+)C";
+    const auto bench_insns = BenchInsns();
+    const auto t_bench = std::chrono::steady_clock::now();
+    u64 bench_c = 0;
+    for (const auto& [off, enc] : bench_insns) {
+        bool unhandled = false;
+        std::string body;
+        suyu::recomp::Translate(enc, off, body, &unhandled);
+        if (unhandled) {
+            Fail("bench Translate unhandled encoding 0x" +
+                 [&] {
+                     std::ostringstream h;
+                     h << std::hex << enc;
+                     return h.str();
+                 }());
+        }
+        src << body;
+        bench_c += body.size();
+    }
+    g_aot_compile.bench_translate_ns = NsSince(t_bench);
+    g_aot_compile.bench_c_bytes = bench_c;
+    src << R"C(}
 )C";
     return src.str();
 }
@@ -345,7 +478,10 @@ bool BuildAndLoadAot(const fs::path& root) {
 #else
     const fs::path src_dir = root / "aot_blocks";
     fs::create_directories(src_dir);
-    if (!WriteFile(src_dir / "blocks.c", BuildAotSource())) {
+    const auto t_translate = std::chrono::steady_clock::now();
+    const std::string aot_src = BuildAotSource();
+    g_aot_compile.translate_ns = NsSince(t_translate);
+    if (!WriteFile(src_dir / "blocks.c", aot_src)) {
         return false;
     }
     if (!WriteFile(src_dir / "CMakeLists.txt",
@@ -372,15 +508,19 @@ bool BuildAndLoadAot(const fs::path& root) {
     if (!cc.empty()) {
         cfg.push_back(std::string("-DCMAKE_C_COMPILER=") + cc);
     }
+    const auto t_cfg = std::chrono::steady_clock::now();
     if (RunArgs(cfg) != 0) {
         Fail("cmake configure aot blocks");
         return false;
     }
+    g_aot_compile.cmake_configure_ns = NsSince(t_cfg);
+    const auto t_build = std::chrono::steady_clock::now();
     if (RunArgs({SUYU_SMOKE_CMAKE, "--build", build.string(), "--config", "Release", "--target",
                  "stack_aot"}) != 0) {
         Fail("cmake build aot blocks");
         return false;
     }
+    g_aot_compile.cmake_build_ns = NsSince(t_build);
 
     fs::path so;
     for (const auto& p :
@@ -394,8 +534,18 @@ bool BuildAndLoadAot(const fs::path& root) {
         Fail("libstack_aot.so not found");
         return false;
     }
+    std::error_code ec;
+    const auto sz = fs::file_size(so, ec);
+    if (ec) {
+        Fail("file_size " + so.string() + ": " + ec.message());
+        return false;
+    }
+    g_aot_compile.so_bytes = static_cast<u64>(sz);
+    g_aot_compile.so_path = so.string();
 
+    const auto t_dl = std::chrono::steady_clock::now();
     g_so = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+    g_aot_compile.dlopen_ns = NsSince(t_dl);
     if (!g_so) {
         Fail(std::string("dlopen: ") + dlerror());
         return false;
@@ -409,6 +559,7 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_aot_proof = reinterpret_cast<BlockFn>(dlsym(g_so, "block_aot_proof"));
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
+    g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
     ExpectTrue("dlsym recomp_set_module_base", g_set_base != nullptr);
     ExpectTrue("dlsym block_tls_svc", g_block_tls != nullptr);
     ExpectTrue("dlsym block_unhandled", g_block_unhandled != nullptr);
@@ -416,8 +567,9 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym block_aot_proof", g_block_aot_proof != nullptr);
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
     ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
+    ExpectTrue("dlsym block_bench", g_block_bench != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
-           g_block_plain && g_block_step_no_svc;
+           g_block_plain && g_block_step_no_svc && g_block_bench;
 #endif
 }
 
@@ -448,6 +600,9 @@ void WriteGuestImage(std::vector<u8>& image) {
     put(kOffPlain, kMovzX0_7);
     put(kOffPlain + 4, kSvc1);
     put(kOffStepNoSvc, kMovzX0_7);
+    for (const auto& [off, enc] : BenchInsns()) {
+        put(off, enc);
+    }
 }
 
 struct StackFixture {
@@ -931,6 +1086,339 @@ void ExportExecutionJson(const fs::path& path) {
     ScenarioPass("AOT/JIT execution JSON from live ArmRecomp stack", before);
 }
 
+nlohmann::json MetricsToJson(const Core::RecompExecutionMetrics& m) {
+    return {
+        {"backends",
+         {{"aot", {{"block_executions", m.aot_block_executions}, {"time_ns", m.aot_time_ns}}},
+          {"dynarmic",
+           {{"run_slices", m.dynarmic_run_slices},
+            {"step_slices", m.dynarmic_step_slices},
+            {"time_ns", m.dynarmic_time_ns}}}}},
+        {"transitions",
+         {{"aot_to_dynarmic", m.aot_to_dynarmic}, {"dynarmic_to_aot", m.dynarmic_to_aot}}},
+        {"fallback_reasons",
+         {{"lookup_miss", m.fallback_lookup_miss},
+          {"unhandled_opcode", m.fallback_unhandled_opcode},
+          {"icache_rejected", m.fallback_icache_rejected},
+          {"no_fallback_available", m.fallback_no_backend}}},
+        {"svc_calls", m.svc_calls},
+    };
+}
+
+Core::RecompExecutionMetrics MetricsDelta(const Core::RecompExecutionMetrics& after,
+                                         const Core::RecompExecutionMetrics& before) {
+    Core::RecompExecutionMetrics d;
+    const auto sub = [](u64 a, u64 b) { return a >= b ? a - b : 0; };
+    d.aot_block_executions = sub(after.aot_block_executions, before.aot_block_executions);
+    d.aot_time_ns = sub(after.aot_time_ns, before.aot_time_ns);
+    d.dynarmic_run_slices = sub(after.dynarmic_run_slices, before.dynarmic_run_slices);
+    d.dynarmic_step_slices = sub(after.dynarmic_step_slices, before.dynarmic_step_slices);
+    d.dynarmic_time_ns = sub(after.dynarmic_time_ns, before.dynarmic_time_ns);
+    d.aot_to_dynarmic = sub(after.aot_to_dynarmic, before.aot_to_dynarmic);
+    d.dynarmic_to_aot = sub(after.dynarmic_to_aot, before.dynarmic_to_aot);
+    d.fallback_lookup_miss = sub(after.fallback_lookup_miss, before.fallback_lookup_miss);
+    d.fallback_unhandled_opcode =
+        sub(after.fallback_unhandled_opcode, before.fallback_unhandled_opcode);
+    d.fallback_icache_rejected =
+        sub(after.fallback_icache_rejected, before.fallback_icache_rejected);
+    d.fallback_no_backend = sub(after.fallback_no_backend, before.fallback_no_backend);
+    d.svc_calls = sub(after.svc_calls, before.svc_calls);
+    return d;
+}
+
+struct SliceStats {
+    u64 count{};
+    u64 first_ns{};
+    u64 min_ns{};
+    u64 max_ns{};
+    u64 sum_ns{};
+    u64 mean_ns{};
+    u64 median_ns{};
+    u64 p95_ns{};
+};
+
+SliceStats SummarizeSlices(std::vector<u64> samples) {
+    SliceStats s;
+    if (samples.empty()) {
+        return s;
+    }
+    s.count = samples.size();
+    s.first_ns = samples.front();
+    s.sum_ns = std::accumulate(samples.begin(), samples.end(), u64{0});
+    s.mean_ns = s.sum_ns / s.count;
+    s.min_ns = *std::min_element(samples.begin(), samples.end());
+    s.max_ns = *std::max_element(samples.begin(), samples.end());
+    std::sort(samples.begin(), samples.end());
+    s.median_ns = samples[samples.size() / 2];
+    const size_t p95_i = (samples.size() * 95) / 100;
+    s.p95_ns = samples[std::min(p95_i, samples.size() - 1)];
+    return s;
+}
+
+nlohmann::json SliceStatsToJson(const SliceStats& s) {
+    return {
+        {"count", s.count},
+        {"first_ns", s.first_ns},
+        {"min_ns", s.min_ns},
+        {"median_ns", s.median_ns},
+        {"mean_ns", s.mean_ns},
+        {"p95_ns", s.p95_ns},
+        {"max_ns", s.max_ns},
+        {"sum_ns", s.sum_ns},
+        {"unit", "host_steady_clock_ns_per_RunThread"},
+        {"note", "No GPU frames in this harness; one RunThread until SVC is one slice/tick."},
+    };
+}
+
+struct ModeResult {
+    const char* id = "";
+    const char* description = "";
+    SliceStats slices{};
+    u64 startup_ns{};
+    u64 compile_ns{};
+    MemSnap mem_before{};
+    MemSnap mem_after_first{};
+    MemSnap mem_after{};
+    u64 x0{};
+    u32 svc{};
+    bool halt_svc{false};
+    Core::RecompExecutionMetrics exec{};
+};
+
+ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
+    ModeResult r;
+    r.id = hybrid_aot ? "hybrid_aot" : "jit";
+    r.description = hybrid_aot
+                        ? "ArmRecomp Translate AOT lookup hit; Dynarmic fallback must not run"
+                        : "ArmRecomp force-miss of the same PC; Dynarmic executes guest RX";
+    g_force_miss_pc = hybrid_aot ? 0 : (g_entry + kOffBench);
+
+    const auto before = Core::GetRecompExecutionMetrics();
+    r.mem_before = ReadMem();
+
+    std::vector<u64> times;
+    times.reserve(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
+        auto& ctx = f.thread->GetContext();
+        ctx = {};
+        ctx.pc = g_entry + kOffBench;
+        ctx.r[1] = 1; // ADD X0, X0, X1 — keeps AOT C from constant-folding 512
+        f.system.Kernel().PhysicalCore(0).LoadContext(f.thread);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto hr = f.arm->RunThread(f.thread);
+        const u64 ns = NsSince(t0);
+        times.push_back(ns);
+        if (i == 0) {
+            r.mem_after_first = ReadMem();
+        }
+
+        const bool svc_halt = True(hr & Core::HaltReason::SupervisorCall);
+        r.halt_svc = r.halt_svc || svc_halt;
+        r.svc = f.arm->GetSvcNumber();
+        Kernel::Svc::ThreadContext out{};
+        f.arm->GetContext(out);
+        r.x0 = out.r[0];
+        if (!svc_halt) {
+            Fail(std::string(r.id) + " slice " + std::to_string(i) + " not SupervisorCall");
+        }
+        if (r.svc != kBenchSvcImm) {
+            Fail(std::string(r.id) + " svc got=" + std::to_string(r.svc) +
+                 " want=" + std::to_string(kBenchSvcImm));
+        }
+        if (r.x0 != static_cast<u64>(kBenchAdds)) {
+            Fail(std::string(r.id) + " x0 got=" + std::to_string(r.x0) +
+                 " want=" + std::to_string(kBenchAdds));
+        }
+    }
+    g_force_miss_pc = 0;
+    r.mem_after = ReadMem();
+    r.slices = SummarizeSlices(std::move(times));
+    r.startup_ns = r.slices.first_ns;
+    r.exec = MetricsDelta(Core::GetRecompExecutionMetrics(), before);
+    if (hybrid_aot) {
+        r.compile_ns = g_aot_compile.translate_ns + g_aot_compile.cmake_configure_ns +
+                       g_aot_compile.cmake_build_ns + g_aot_compile.dlopen_ns;
+    } else {
+        const u64 steady = r.slices.median_ns;
+        r.compile_ns = r.slices.first_ns > steady ? r.slices.first_ns - steady : 0;
+    }
+    return r;
+}
+
+nlohmann::json ModeToJson(const ModeResult& r) {
+    const std::int64_t rss_delta =
+        static_cast<std::int64_t>(r.mem_after.vmrss_kb) - static_cast<std::int64_t>(r.mem_before.vmrss_kb);
+    const std::int64_t rss_first_delta = static_cast<std::int64_t>(r.mem_after_first.vmrss_kb) -
+                                static_cast<std::int64_t>(r.mem_before.vmrss_kb);
+    nlohmann::json generated;
+    if (std::string_view(r.id) == "hybrid_aot") {
+        generated = {
+            {"aot_so_bytes", g_aot_compile.so_bytes},
+            {"aot_so_path", g_aot_compile.so_path},
+            {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes},
+            {"note", "so includes integration blocks as well as the bench block"},
+        };
+    } else {
+        generated = {
+            {"jit_rss_delta_after_first_slice_bytes", rss_first_delta * 1024},
+            {"jit_rss_delta_after_all_slices_bytes", rss_delta * 1024},
+            {"note", "RSS delta around first Dynarmic slice (code-cache commit + this block). "
+                     "Dynarmic reserves up to 128MiB code cache; RSS is committed pages."},
+        };
+    }
+    return {
+        {"backend", r.id},
+        {"description", r.description},
+        {"slices", SliceStatsToJson(r.slices)},
+        {"startup_ns", r.startup_ns},
+        {"compile_ns", r.compile_ns},
+        {"compile_ns_meaning",
+         std::string_view(r.id) == "hybrid_aot"
+             ? "AOT Translate + cmake configure/build of libstack_aot.so + dlopen"
+             : "approx first-JIT compile: first_slice_ns - median_ns"},
+        {"memory",
+         {{"sampler", "/proc/self/status"},
+          {"rss_kb_before", r.mem_before.vmrss_kb},
+          {"rss_kb_after_first_slice", r.mem_after_first.vmrss_kb},
+          {"rss_kb_after", r.mem_after.vmrss_kb},
+          {"rss_kb_delta", rss_delta},
+          {"hwm_kb_after", r.mem_after.vmhwm_kb},
+          {"vmsize_kb_after", r.mem_after.vmsize_kb}}},
+        {"generated_binary", std::move(generated)},
+        {"correctness",
+         {{"x0", r.x0},
+          {"svc", r.svc},
+          {"halt_supervisor_call", r.halt_svc},
+          {"expected_x0", kBenchAdds},
+          {"expected_svc", kBenchSvcImm}}},
+        {"execution_metrics_delta", MetricsToJson(r.exec)},
+    };
+}
+
+void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const ModeResult& jit,
+                         int iters) {
+    const int before = g_fails;
+    std::ostringstream entry_pc;
+    entry_pc << "0x" << std::hex << (g_entry + kOffBench);
+    const nlohmann::json doc{
+        {"schema_version", 1},
+        {"kind", "recomp_benchmark"},
+        {"clock", "steady_clock"},
+        {"related",
+         {{"recomp_execution", "schema_version 1 kind=recomp_execution from ArmRecomp (#2)"},
+          {"note", "Per-mode execution_metrics_delta is a GetRecompExecutionMetrics() window "
+                   "around that mode's slices, not the mixed-scenario recomp_execution.json."}}},
+        {"host", {{"cpu", HostCpu()}, {"rss_sampler", "/proc/self/status VmRSS/VmHWM/VmSize (kB)"}}},
+        {"workload",
+         {{"name", "alu_add_svc"},
+          {"identical_across_backends", true},
+          {"guest_pc_offset", "0x2400"},
+          {"entry_pc", entry_pc.str()},
+          {"guest_instruction_count", kBenchAdds + 2},
+          {"encodings",
+           nlohmann::json::array({
+               {{"asm", "movz x0, #0"}, {"encoding", "0xD2800000"}},
+               {{"asm", "add x0, x0, x1"},
+                {"encoding", "0x8B010000"},
+                {"repeat", kBenchAdds},
+                {"x1", 1}},
+               {{"asm", "svc #3"}, {"encoding", "0xD4000061"}},
+           })},
+          {"expected_x0", kBenchAdds},
+          {"expected_svc", kBenchSvcImm},
+          {"iters", iters}}},
+        {"aot_compile",
+         {{"translate_ns", g_aot_compile.translate_ns},
+          {"bench_translate_ns", g_aot_compile.bench_translate_ns},
+          {"cmake_configure_ns", g_aot_compile.cmake_configure_ns},
+          {"cmake_build_ns", g_aot_compile.cmake_build_ns},
+          {"dlopen_ns", g_aot_compile.dlopen_ns},
+          {"so_bytes", g_aot_compile.so_bytes},
+          {"so_path", g_aot_compile.so_path},
+          {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes}}},
+        {"modes", {{"hybrid_aot", ModeToJson(aot)}, {"jit", ModeToJson(jit)}}},
+    };
+
+    if (path.has_parent_path()) {
+        fs::create_directories(path.parent_path());
+    }
+    {
+        std::ofstream out(path);
+        if (!out) {
+            Fail("write " + path.string());
+            return;
+        }
+        out << doc.dump(2) << '\n';
+        if (!out) {
+            Fail("flush " + path.string());
+            return;
+        }
+    }
+    Pass("wrote " + path.string());
+
+    std::ifstream in(path);
+    std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    ExpectTrue("bench JSON kind recomp_benchmark",
+               json.find("\"kind\": \"recomp_benchmark\"") != std::string::npos);
+    ExpectTrue("bench JSON schema_version 1",
+               json.find("\"schema_version\": 1") != std::string::npos);
+    ExpectTrue("bench JSON hybrid_aot mode", json.find("\"hybrid_aot\"") != std::string::npos);
+    ExpectTrue("bench JSON jit mode", json.find("\"jit\"") != std::string::npos);
+    ExpectTrue("bench JSON so_bytes", json.find("\"so_bytes\"") != std::string::npos);
+    std::cout << "recomp_benchmark.json path: " << path << "\n";
+    std::cout << "=== recomp_benchmark.json ===\n" << json << std::endl;
+    ScenarioPass("JIT vs hybrid AOT benchmark JSON from identical guest fixture", before);
+}
+
+void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
+    const int before = g_fails;
+    // Fresh application process: AllowsAot, lookup still set, Dynarmic not yet
+    // constructed. Hybrid AOT runs first so JIT compile is isolated to the jit mode.
+    if (!f.BootstrapSecondProcess()) {
+        return;
+    }
+    auto* recomp = AsRecomp(f.arm);
+    ExpectTrue("bench ArmRecomp", recomp != nullptr);
+    ExpectTrue("bench AllowsAot", recomp && recomp->AllowsAot());
+    ExpectTrue("bench lookup registered",
+               Lookup(g_entry + kOffBench) == g_block_bench && g_block_bench != nullptr);
+    ExpectEq("bench guest RX movz", f.system.ApplicationMemory().Read32(g_entry + kOffBench),
+             kMovzX0_0);
+    ExpectEq("bench guest RX add", f.system.ApplicationMemory().Read32(g_entry + kOffBench + 4),
+             kAddX0X0X1);
+    ExpectEq("bench guest RX svc",
+             f.system.ApplicationMemory().Read32(g_entry + kOffBench +
+                                                 4ull * (static_cast<u64>(kBenchAdds) + 1)),
+             kSvc3);
+
+    const int iters = BenchIters();
+    std::cout << "bench iters=" << iters << " adds=" << kBenchAdds << " pc=" << std::hex
+              << (g_entry + kOffBench) << std::dec << "\n";
+
+    const ModeResult aot = RunIdenticalWorkload(f, true, iters);
+    ExpectTrue("hybrid AOT stayed on AOT", aot.exec.aot_block_executions >= static_cast<u64>(iters));
+    ExpectTrue("hybrid AOT time_ns > 0", aot.exec.aot_time_ns > 0);
+    ExpectEq("hybrid AOT no Dynarmic fallback", aot.exec.dynarmic_run_slices, 0);
+    ExpectEq("hybrid AOT no lookup miss", aot.exec.fallback_lookup_miss, 0);
+    ExpectTrue("hybrid AOT slice times real", aot.slices.median_ns > 0 && aot.slices.first_ns > 0);
+    ExpectTrue("AOT so_bytes > 0", g_aot_compile.so_bytes > 0);
+    ExpectTrue("AOT compile_ns > 0", aot.compile_ns > 0);
+
+    const ModeResult jit = RunIdenticalWorkload(f, false, iters);
+    ExpectTrue("JIT Dynarmic slices", jit.exec.dynarmic_run_slices >= static_cast<u64>(iters));
+    ExpectTrue("JIT Dynarmic time_ns > 0", jit.exec.dynarmic_time_ns > 0);
+    ExpectTrue("JIT lookup miss recorded", jit.exec.fallback_lookup_miss > 0);
+    ExpectEq("JIT did not execute AOT blocks", jit.exec.aot_block_executions, 0);
+    ExpectTrue("JIT slice times real", jit.slices.median_ns > 0 && jit.slices.first_ns > 0);
+    ExpectEq("both modes x0", aot.x0, jit.x0);
+    ExpectEq("both modes svc", static_cast<u64>(aot.svc), static_cast<u64>(jit.svc));
+
+    ExportBenchmarkJson(json_path, aot, jit, iters);
+    ScenarioPass("identical JIT vs hybrid AOT workload (slice/startup/compile/memory/size)",
+                 before);
+}
+
 void PrintGaps() {
     std::cout
         << "GAPS (honest / out of scope):\n"
@@ -938,12 +1426,16 @@ void PrintGaps() {
         << "  - Multi-core KScheduler fiber world / CpuManager guest loop\n"
         << "  - Real NSO/NRO homebrew load (keys/firmware/dumps)\n"
         << "  - gdbstub StepThread against a live title\n"
-        << "  - JIT vs hybrid AOT benchmarks (backlog #3) — JSON is the input, not the race\n"
+        << "  - GPU frame times (this harness has no renderer; slice = RunThread until SVC)\n"
+        << "  - Isolated JIT code-cache byte size (Dynarmic does not expose used bytes; RSS delta)\n"
+        << "  - AOT .so size includes non-bench integration blocks\n"
+        << "  - #4 instruction correctness, #5 compatibility, #6 opts, #7 release-gate\n"
         << "Pinned here: SetRecompLookup ArmRecomp, AllowsAot after Invalidate,\n"
         << "  Translate AOT != guest RX twin, Lookup consulted, LoadContext TLS,\n"
         << "  registered-PC force-miss, ClearInstructionCache, restart, StepThread,\n"
         << "  leftover pending_svc cleared on StepThread, live AOT/Dynarmic timers +\n"
-        << "  fallback reasons + icache JSON export (path-safe tmp+rename).\n";
+        << "  fallback reasons + icache JSON export (path-safe tmp+rename),\n"
+        << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json).\n";
 }
 
 } // namespace
@@ -952,6 +1444,7 @@ int main() {
     std::cout << std::unitbuf;
     std::cerr << std::unitbuf;
     std::cout << "recomp_stack_harness: SetRecompLookup ArmRecomp + Translate AOT + Dynarmic\n";
+    std::cout << "  (+ identical-PC JIT vs hybrid AOT benchmark)\n";
 
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const fs::path root =
@@ -985,6 +1478,14 @@ int main() {
         return work / "recomp_execution.json";
     }(root);
     ExportExecutionJson(json_path);
+
+    const fs::path bench_path = [](const fs::path& work) {
+        if (const char* env = std::getenv("SUYU_RECOMP_BENCHMARK_JSON"); env && env[0] != '\0') {
+            return fs::path(env);
+        }
+        return work / "recomp_benchmark.json";
+    }(root);
+    ScenarioBenchmark(*fix, bench_path);
     PrintGaps();
 
     if (g_fails == 0) {

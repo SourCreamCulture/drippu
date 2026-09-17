@@ -4,6 +4,9 @@
 # Standalone (and optionally nested) exporter smoke: EmitProject compile plus
 # RET/BLR branch probes against the active arm64_to_c.h header. Does not use
 # tools/static_recompiler.
+#
+# Nested full-tree target recomp_stack_harness also races JIT vs hybrid AOT
+# (drippu backlog #3) and writes recomp_benchmark.json.
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -59,6 +62,6 @@ if (NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_include_directories(recomp_stack_harness PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     add_test(NAME recomp_stack_harness COMMAND recomp_stack_harness)
     set_tests_properties(recomp_stack_harness PROPERTIES
-        TIMEOUT 180
+        TIMEOUT 240
     )
 endif()

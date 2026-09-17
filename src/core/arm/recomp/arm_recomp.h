@@ -79,6 +79,11 @@ RecompLookupFn GetRecompLookup();
 /// icache.{clear_instruction_cache_calls,invalidate_cache_range_calls,
 ///         permanent_aot_reject_events,jit_halt_cache_invalidation},
 /// plus svc_calls, unresolved_import_traps, and histograms.
+///
+/// Benchmark comparison (drippu backlog #3) is not this snapshot. The stack
+/// harness races the same guest fixture under JIT vs hybrid AOT and writes
+/// `recomp_benchmark.json` (`kind=recomp_benchmark`), embedding per-mode
+/// GetRecompExecutionMetrics() deltas. Override with $SUYU_RECOMP_BENCHMARK_JSON.
 /// Default path: $SUYU_RECOMP_EXECUTION_JSON, else `{LogDir}/recomp_execution.json`
 /// (Linux: ~/.local/share/suyu/log/recomp_execution.json unless portable `user/`).
 /// WriteRecompExecutionJson keeps `std::filesystem::path` (no narrow `.string()`
