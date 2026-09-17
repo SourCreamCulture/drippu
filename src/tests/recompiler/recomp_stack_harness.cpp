@@ -15,9 +15,11 @@
 //
 // The bench ADD chain is punctuated with STR/LDR of x0 through the opaque
 // host_mem callbacks so Release (-O3) cannot strength-reduce 512 ADDs to
-// `x1 << 9`. JudgeAotBenchDump is the objdump pin: a synthetic
-// `shl $0x9` + `jmp recomp_svc@plt` dump must FAIL (a lower PLT address is
-// not an in-function loop). Live -O3 must PASS (adds + store/load).
+// `x1 << 9`. JudgeAotBenchDump: a PLT jmp is not a loop (discriminating dump:
+// store+load + 1 add + PLT jmp + no shl/imul must FAIL, with count asserts).
+// Named `recomp_store64@plt` is a gcc PIC accident — clang/aarch64 `bl` may
+// have store=0; that is not a fold. Live pin is: not shl/imul, plus runtime
+// host_mem callback counts (512 × iters).
 //
 // Does not call Svc::Call / PhysicalCore::RunThread (fixture SVC imms are not
 // safe live HLE). Does not load copyrighted titles or keys.
@@ -225,12 +227,27 @@ struct AotCompileCosts {
     u64 disasm_imul512_count{};
     u64 disasm_backward_jumps{};
     u64 disasm_plt_jumps{};
-    u64 disasm_store64_calls{};
+    u64 disasm_store64_calls{}; // named PLT in objdump (gcc PIC; may be 0 on clang)
     u64 disasm_load64_calls{};
     bool not_single_shift{};
     std::string disasm_excerpt;
+    u64 clang_disasm_add{};
+    u64 clang_disasm_store64{};
+    u64 clang_disasm_load64{};
+    bool clang_not_reported_folded{true};
+    std::string clang_dump_reason;
 };
 AotCompileCosts g_aot_compile;
+
+u64* g_hm_load_calls = nullptr;
+u64* g_hm_store_calls = nullptr;
+
+u64 HmLoadCalls() {
+    return g_hm_load_calls ? *g_hm_load_calls : 0;
+}
+u64 HmStoreCalls() {
+    return g_hm_store_calls ? *g_hm_store_calls : 0;
+}
 
 u64 NsSince(std::chrono::steady_clock::time_point t0) {
     const auto raw =
@@ -417,19 +434,18 @@ DisasmCounts CountBlockBenchOps(const std::string& fn) {
     return c;
 }
 
-// Folded x1<<9 must lose even when an SVC jmp to a lower PLT looks "backward".
+// Folded x1<<9 must lose. A PLT jmp is not an in-function loop: store+load +
+// 1 add + PLT jmp + no shl/imul is FAIL. Named recomp_store64 in the dump is
+// not required for PASS (clang PIC / aarch64 bl may omit it).
 BenchDumpVerdict JudgeAotBenchDump(const DisasmCounts& n) {
     if (n.shl9 > 0 || n.imul512 > 0) {
         return {false, "host fold: shl $0x9 / imul $512"};
     }
-    if (n.store64 < 1 || n.load64 < 1) {
-        return {false, "missing recomp_store64/recomp_load64 (add-only is foldable)"};
-    }
     if (n.add >= static_cast<u64>(kBenchAdds)) {
-        return {true, "unrolled >=512 adds with store/load"};
+        return {true, "unrolled >=512 adds (named store/load PLT not required)"};
     }
     if (n.backward_jumps >= 1 && n.add >= 1) {
-        return {true, "in-function add loop with store/load"};
+        return {true, "in-function add loop"};
     }
     return {false, "too few adds and no in-function loop"};
 }
@@ -473,6 +489,25 @@ void ExpectDumpVerdict(const char* name, const std::string& dump, bool want_ok) 
     }
 }
 
+void ExpectDumpCounts(const char* name, const DisasmCounts& n, u64 add, u64 shl9, u64 imul512,
+                      u64 backward_jumps, u64 plt_jumps, u64 store64, u64 load64) {
+    auto chk = [&](const char* field, u64 got, u64 want) {
+        if (got != want) {
+            Fail(std::string(name) + " " + field + ": got=" + std::to_string(got) +
+                 " want=" + std::to_string(want));
+        } else {
+            Pass(std::string(name) + " " + field + "=" + std::to_string(got));
+        }
+    };
+    chk("add", n.add, add);
+    chk("shl9", n.shl9, shl9);
+    chk("imul512", n.imul512, imul512);
+    chk("backward_jumps", n.backward_jumps, backward_jumps);
+    chk("plt_jumps", n.plt_jumps, plt_jumps);
+    chk("store64", n.store64, store64);
+    chk("load64", n.load64, load64);
+}
+
 void ScenarioFoldPinSelfCheck() {
     const int before = g_fails;
     // Tabs match GNU objdump. PLT is at a lower address than block_bench, so a
@@ -509,6 +544,23 @@ void ScenarioFoldPinSelfCheck() {
         "    1418:\te9 a3 fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
     ExpectDumpVerdict("add-only dump (no store/load) is rejected", add_only, false);
 
+    // Discriminating dump: store+load + 1 add + PLT jmp + no shl/imul.
+    // If fn_lo/fn_hi is reverted, plt_jmp is counted as backward_jumps and
+    // this dump wrongly PASSes as an in-function loop.
+    const std::string plt_not_loop =
+        "0000000000001410 <block_bench>:\n"
+        "    1410:\te8 8b fc ff ff      \tcall   10a0 <recomp_store64@plt>\n"
+        "    1415:\te8 96 fc ff ff      \tcall   10b0 <recomp_load64@plt>\n"
+        "    141a:\t48 03 43 08         \tadd    0x8(%rbx),%rax\n"
+        "    141e:\te9 9d fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    {
+        const DisasmCounts n = CountBlockBenchOps(plt_not_loop);
+        ExpectDumpCounts("discriminating PLT dump", n, /*add=*/1, /*shl9=*/0, /*imul512=*/0,
+                         /*backward_jumps=*/0, /*plt_jumps=*/1, /*store64=*/1, /*load64=*/1);
+        ExpectDumpVerdict("discriminating store+load+1 add+PLT jmp (no shl) is rejected",
+                          plt_not_loop, false);
+    }
+
     const std::string honest_loop =
         "0000000000001410 <block_bench>:\n"
         "    1410:\t48 c7 07 00 00 00 00\tmovq   $0x0,(%rdi)\n"
@@ -519,7 +571,26 @@ void ScenarioFoldPinSelfCheck() {
         "    1427:\tc3                  \tret\n";
     ExpectDumpVerdict("in-function add+store+load loop is accepted", honest_loop, true);
 
-    ScenarioPass("objdump fold pin rejects shl $0x9 + SVC jmp", before);
+    // clang 18 PIC: 512 adds, many calls, no named recomp_store64/load64.
+    // Must PASS (not reported as folded). AArch64 `bl` looks the same to this pin.
+    std::ostringstream clang_like;
+    clang_like << "0000000000001410 <block_bench>:\n";
+    u64 addr = 0x1410;
+    for (int i = 0; i < kBenchAdds; ++i) {
+        clang_like << "    " << std::hex << addr
+                   << ":\t48 03 43 08          \tadd    0x8(%rbx),%rax\n";
+        addr += 4;
+    }
+    clang_like << "    " << std::hex << addr << ":\te9 00 fc ff ff      \tjmp    10c0 <recomp_svc@plt>\n";
+    {
+        const std::string dump = clang_like.str();
+        const DisasmCounts n = CountBlockBenchOps(dump);
+        ExpectDumpCounts("clang-like unnamed dump", n, static_cast<u64>(kBenchAdds), 0, 0, 0, 1, 0,
+                         0);
+        ExpectDumpVerdict("clang-like 512 adds with no named store/load is not folded", dump, true);
+    }
+
+    ScenarioPass("objdump fold pin rejects shl $0x9 + SVC jmp; PLT is not a loop", before);
 }
 
 #ifndef _WIN32
@@ -568,13 +639,63 @@ void PinAotBenchNotFolded(const fs::path& so) {
     }
     const DisasmCounts n = CountBlockBenchOps(fn);
     RecordBenchDump(n, fn);
-    if (!g_aot_compile.not_single_shift) {
+    if (n.shl9 > 0 || n.imul512 > 0) {
         Fail("AOT block_bench was host-folded (x1<<9 / imul 512), not 512 adds; dump:\n" + fn);
         return;
     }
+    if (!g_aot_compile.not_single_shift) {
+        Fail("AOT block_bench dump is not 512 adds and not an in-function loop; dump:\n" + fn);
+        return;
+    }
     ExpectTrue("AOT block_bench is not a single x1<<9", g_aot_compile.not_single_shift);
-    ExpectTrue("AOT block_bench has recomp_store64 calls in dump", n.store64 >= 1);
-    ExpectTrue("AOT block_bench has recomp_load64 calls in dump", n.load64 >= 1);
+    // Named recomp_store64@plt is gcc PIC, not the pin. clang / aarch64 bl may
+    // have store64=0; that must not be reported as a fold. Runtime host_mem
+    // callback counts (512 × iters) pin that the memory ops actually ran.
+}
+
+void PinClangDumpNotFalseFolded(const fs::path& blocks_c) {
+    const char* clang = "/usr/bin/clang-18";
+    if (!fs::exists(clang)) {
+        clang = "/usr/bin/clang";
+    }
+    if (!fs::exists(clang)) {
+        std::cout << "clang not found; host_mem callback counts still pin store/load\n";
+        g_aot_compile.clang_dump_reason = "clang not found";
+        return;
+    }
+    const fs::path out = blocks_c.parent_path() / "libstack_aot_clang.so";
+    const int rc = RunArgs({clang, "-O3", "-fPIC", "-shared", "-std=c11", "-o", out.string(),
+                            blocks_c.string()});
+    if (rc != 0 || !fs::exists(out)) {
+        Fail(std::string("clang -O3 AOT .so failed rc=") + std::to_string(rc));
+        g_aot_compile.clang_dump_reason = "clang compile failed";
+        return;
+    }
+    const std::string dump = PopenDump("objdump -d " + Quote(out.string()) + " 2>/dev/null");
+    const std::string fn = ExtractObjdumpFn(dump, "block_bench");
+    if (fn.empty()) {
+        Fail("clang objdump missing <block_bench>");
+        return;
+    }
+    const DisasmCounts n = CountBlockBenchOps(fn);
+    g_aot_compile.clang_disasm_add = n.add;
+    g_aot_compile.clang_disasm_store64 = n.store64;
+    g_aot_compile.clang_disasm_load64 = n.load64;
+    const auto v = JudgeAotBenchDump(n);
+    g_aot_compile.clang_not_reported_folded = v.ok && n.shl9 == 0 && n.imul512 == 0;
+    g_aot_compile.clang_dump_reason = v.reason;
+    std::cout << "clang -O3 block_bench objdump: add=" << n.add << " shl9=" << n.shl9
+              << " imul512=" << n.imul512 << " store64=" << n.store64 << " load64=" << n.load64
+              << " call=" << n.call << " in_fn_back=" << n.backward_jumps
+              << " plt_jmp=" << n.plt_jumps << " -> " << v.reason << "\n";
+    if (n.shl9 > 0 || n.imul512 > 0) {
+        Fail("clang -O3 folded bench to shl/imul (unexpected with STR/LDR fixture)");
+        return;
+    }
+    ExpectTrue("clang -O3 dump is not reported as folded", g_aot_compile.clang_not_reported_folded);
+    if (n.store64 == 0 && n.load64 == 0) {
+        Pass("clang -O3 has no named recomp_store64/load64 (PIC accident, not a fold)");
+    }
 }
 #endif
 
@@ -673,6 +794,8 @@ typedef struct RecompHostMem {
 } RecompHostMem;
 
 uint64_t g_module_base = 0;
+uint64_t g_recomp_hm_load_calls = 0;
+uint64_t g_recomp_hm_store_calls = 0;
 
 void recomp_set_module_base(uint64_t b) { g_module_base = b; }
 
@@ -683,11 +806,13 @@ void recomp_unhandled(GuestContext* c, uint32_t insn, uint64_t pc) {
     c->halted = RECOMP_HALT_UNHANDLED;
 }
 uint64_t recomp_load64(GuestContext* c, uint64_t a) {
+    ++g_recomp_hm_load_calls;
     const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
     if (hm && hm->load) return hm->load(hm->user, a, 8);
     return 0;
 }
 void recomp_store64(GuestContext* c, uint64_t a, uint64_t v) {
+    ++g_recomp_hm_store_calls;
     const RecompHostMem* hm = (const RecompHostMem*)c->host_mem;
     if (hm && hm->store) hm->store(hm->user, a, 8, v);
 }
@@ -851,6 +976,7 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_aot_compile.so_bytes = static_cast<u64>(sz);
     g_aot_compile.so_path = so.string();
     PinAotBenchNotFolded(so);
+    PinClangDumpNotFalseFolded(src_dir / "blocks.c");
 
     const auto t_dl = std::chrono::steady_clock::now();
     g_so = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -869,6 +995,8 @@ bool BuildAndLoadAot(const fs::path& root) {
     g_block_plain = reinterpret_cast<BlockFn>(dlsym(g_so, "block_plain"));
     g_block_step_no_svc = reinterpret_cast<BlockFn>(dlsym(g_so, "block_step_no_svc"));
     g_block_bench = reinterpret_cast<BlockFn>(dlsym(g_so, "block_bench"));
+    g_hm_load_calls = static_cast<u64*>(dlsym(g_so, "g_recomp_hm_load_calls"));
+    g_hm_store_calls = static_cast<u64*>(dlsym(g_so, "g_recomp_hm_store_calls"));
     ExpectTrue("dlsym recomp_set_module_base", g_set_base != nullptr);
     ExpectTrue("dlsym block_tls_svc", g_block_tls != nullptr);
     ExpectTrue("dlsym block_unhandled", g_block_unhandled != nullptr);
@@ -877,8 +1005,11 @@ bool BuildAndLoadAot(const fs::path& root) {
     ExpectTrue("dlsym block_plain", g_block_plain != nullptr);
     ExpectTrue("dlsym block_step_no_svc", g_block_step_no_svc != nullptr);
     ExpectTrue("dlsym block_bench", g_block_bench != nullptr);
+    ExpectTrue("dlsym g_recomp_hm_load_calls", g_hm_load_calls != nullptr);
+    ExpectTrue("dlsym g_recomp_hm_store_calls", g_hm_store_calls != nullptr);
     return g_set_base && g_block_tls && g_block_unhandled && g_block_miss && g_block_aot_proof &&
-           g_block_plain && g_block_step_no_svc && g_block_bench;
+           g_block_plain && g_block_step_no_svc && g_block_bench && g_hm_load_calls &&
+           g_hm_store_calls;
 #endif
 }
 
@@ -1492,6 +1623,8 @@ struct ModeResult {
     u32 svc{};
     bool halt_svc{false};
     Core::RecompExecutionMetrics exec{};
+    u64 hm_load_calls{};
+    u64 hm_store_calls{};
 };
 
 ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
@@ -1502,6 +1635,8 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
                         : "ArmRecomp force-miss of the same PC; Dynarmic executes guest RX";
     g_force_miss_pc = hybrid_aot ? 0 : (g_entry + kOffBench);
 
+    const u64 hm_load0 = HmLoadCalls();
+    const u64 hm_store0 = HmStoreCalls();
     const auto before = Core::GetRecompExecutionMetrics();
     r.mem_before = ReadMem();
 
@@ -1546,6 +1681,8 @@ ModeResult RunIdenticalWorkload(StackFixture& f, bool hybrid_aot, int iters) {
     r.slices = SummarizeSlices(std::move(times));
     r.startup_ns = r.slices.first_ns;
     r.exec = MetricsDelta(Core::GetRecompExecutionMetrics(), before);
+    r.hm_load_calls = HmLoadCalls() - hm_load0;
+    r.hm_store_calls = HmStoreCalls() - hm_store0;
     if (hybrid_aot) {
         r.compile_ns = g_aot_compile.translate_ns + g_aot_compile.cmake_configure_ns +
                        g_aot_compile.cmake_build_ns + g_aot_compile.dlopen_ns;
@@ -1603,6 +1740,11 @@ nlohmann::json ModeToJson(const ModeResult& r) {
           {"expected_x0", kBenchAdds},
           {"expected_svc", kBenchSvcImm}}},
         {"execution_metrics_delta", MetricsToJson(r.exec)},
+        {"host_mem_callbacks",
+         {{"load", r.hm_load_calls},
+          {"store", r.hm_store_calls},
+          {"note", "recomp_load64/store64 increments around host_mem function-pointer "
+                   "calls; AOT bench must be 512 x iters; JIT must be 0"}}},
     };
 }
 
@@ -1626,7 +1768,9 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"anti_fold",
            "each ADD is preceded by STR/LDR of x0 through host_mem function pointers "
            "so -O3 cannot reduce 512 ADDs to x1<<9; JudgeAotBenchDump FAILs a "
-           "synthetic shl $0x9 + jmp recomp_svc@plt dump (PLT jmp is not a loop)"},
+           "discriminating store+load+1 add+PLT jmp dump (PLT is not a loop); "
+           "named recomp_store64@plt is not the live pin; host_mem callbacks "
+           "must be 512 x iters"},
           {"guest_pc_offset", "0x2400"},
           {"entry_pc", entry_pc.str()},
           {"guest_instruction_count", kBenchAdds * 3 + 2},
@@ -1654,18 +1798,27 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
           {"so_path", g_aot_compile.so_path},
           {"bench_generated_c_bytes", g_aot_compile.bench_c_bytes},
           {"host_opt_check",
-           {{"method", "objdump -d <block_bench> + JudgeAotBenchDump"},
+           {{"method", "objdump -d <block_bench> + JudgeAotBenchDump + host_mem callback counts"},
             {"pin",
-             "FAIL if shl $0x9 / imul $512, or if store64/load64 missing; a jmp to "
-             "a lower recomp_svc@plt is plt_jumps not an in-function loop"},
+             "FAIL dump if shl $0x9 / imul $512, or if too few adds and no in-function "
+             "loop. A jmp to a lower recomp_svc@plt is plt_jumps not a loop "
+             "(discriminating dump: store+load + 1 add + PLT jmp + no shl/imul). "
+             "Named recomp_store64@plt is gcc PIC, not required for PASS. Live "
+             "store/load pin is host_mem_callbacks == 512 * iters."},
             {"add_mnemonics", g_aot_compile.disasm_add_count},
             {"shift_by_9", g_aot_compile.disasm_shl9_count},
             {"imul_512", g_aot_compile.disasm_imul512_count},
             {"backward_jumps", g_aot_compile.disasm_backward_jumps},
             {"plt_jumps", g_aot_compile.disasm_plt_jumps},
-            {"store64_calls", g_aot_compile.disasm_store64_calls},
-            {"load64_calls", g_aot_compile.disasm_load64_calls},
+            {"named_store64_plt", g_aot_compile.disasm_store64_calls},
+            {"named_load64_plt", g_aot_compile.disasm_load64_calls},
             {"not_single_shift", g_aot_compile.not_single_shift},
+            {"clang_o3",
+             {{"add_mnemonics", g_aot_compile.clang_disasm_add},
+              {"named_store64_plt", g_aot_compile.clang_disasm_store64},
+              {"named_load64_plt", g_aot_compile.clang_disasm_load64},
+              {"not_reported_folded", g_aot_compile.clang_not_reported_folded},
+              {"reason", g_aot_compile.clang_dump_reason}}},
             {"excerpt", g_aot_compile.disasm_excerpt}}}}},
         {"modes", {{"hybrid_aot", ModeToJson(aot)}, {"jit", ModeToJson(jit)}}},
     };
@@ -1697,12 +1850,8 @@ void ExportBenchmarkJson(const fs::path& path, const ModeResult& aot, const Mode
     ExpectTrue("bench JSON jit mode", json.find("\"jit\"") != std::string::npos);
     ExpectTrue("bench JSON not_single_shift",
                json.find("\"not_single_shift\": true") != std::string::npos);
-    ExpectTrue("bench JSON store64_calls > 0",
-               json.find("\"store64_calls\":") != std::string::npos &&
-                   json.find("\"store64_calls\": 0") == std::string::npos);
-    ExpectTrue("bench JSON load64_calls > 0",
-               json.find("\"load64_calls\":") != std::string::npos &&
-                   json.find("\"load64_calls\": 0") == std::string::npos);
+    ExpectTrue("bench JSON host_mem_callbacks",
+               json.find("\"host_mem_callbacks\"") != std::string::npos);
     std::cout << "recomp_benchmark.json path: " << path << "\n";
     std::cout << "=== recomp_benchmark.json ===\n" << json << std::endl;
     ScenarioPass("JIT vs hybrid AOT benchmark JSON from identical guest fixture", before);
@@ -1746,6 +1895,10 @@ void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
     ExpectTrue("hybrid AOT slice times real", aot.slices.median_ns > 0 && aot.slices.first_ns > 0);
     ExpectTrue("AOT so_bytes > 0", g_aot_compile.so_bytes > 0);
     ExpectTrue("AOT compile_ns > 0", aot.compile_ns > 0);
+    ExpectEq("AOT host_mem store callbacks", aot.hm_store_calls,
+             static_cast<u64>(kBenchAdds) * static_cast<u64>(iters));
+    ExpectEq("AOT host_mem load callbacks", aot.hm_load_calls,
+             static_cast<u64>(kBenchAdds) * static_cast<u64>(iters));
 
     const ModeResult jit = RunIdenticalWorkload(f, false, iters);
     ExpectTrue("JIT Dynarmic slices", jit.exec.dynarmic_run_slices >= static_cast<u64>(iters));
@@ -1753,6 +1906,8 @@ void ScenarioBenchmark(StackFixture& f, const fs::path& json_path) {
     ExpectTrue("JIT lookup miss recorded", jit.exec.fallback_lookup_miss > 0);
     ExpectEq("JIT did not execute AOT blocks", jit.exec.aot_block_executions, 0);
     ExpectTrue("JIT slice times real", jit.slices.median_ns > 0 && jit.slices.first_ns > 0);
+    ExpectEq("JIT host_mem store callbacks (AOT helpers unused)", jit.hm_store_calls, 0);
+    ExpectEq("JIT host_mem load callbacks (AOT helpers unused)", jit.hm_load_calls, 0);
     ExpectEq("both modes x0", aot.x0, jit.x0);
     ExpectEq("both modes svc", static_cast<u64>(aot.svc), static_cast<u64>(jit.svc));
 
@@ -1779,7 +1934,9 @@ void PrintGaps() {
         << "  leftover pending_svc cleared on StepThread, live AOT/Dynarmic timers +\n"
         << "  fallback reasons + icache JSON export (path-safe tmp+rename),\n"
         << "  identical-PC JIT vs hybrid AOT race (recomp_benchmark.json),\n"
-        << "  JudgeAotBenchDump FAILs synthetic shl $0x9 + SVC plt jmp; live -O3 PASS.\n";
+        << "  JudgeAotBenchDump FAILs discriminating PLT dump (counts lock PLT vs loop);\n"
+        << "  live gcc -O3 PASS; named store/load PLT not required; host_mem callbacks "
+           "512 x iters.\n";
 }
 
 } // namespace

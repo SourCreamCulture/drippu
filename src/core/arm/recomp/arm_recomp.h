@@ -85,9 +85,10 @@ RecompLookupFn GetRecompLookup();
 /// `recomp_benchmark.json` (`kind=recomp_benchmark`), embedding per-mode
 /// GetRecompExecutionMetrics() deltas. The bench ADD chain is STR/LDR-punctuated
 /// so host -O3 cannot fold it to `x1 << 9`. The harness objdumps `block_bench`
-/// and JudgeAotBenchDump fails on `shl $0x9` / `imul $512` even when the SVC
-/// is a `jmp` to a lower PLT (that jump is not a loop). Override with
-/// $SUYU_RECOMP_BENCHMARK_JSON.
+/// and JudgeAotBenchDump fails on `shl $0x9` / `imul $512`; a jmp to a lower
+/// PLT is not a loop. Named `recomp_store64@plt` is not the live pin (clang
+/// PIC may omit it). Runtime host_mem load/store callback counts must be
+/// 512 × iters. Override with $SUYU_RECOMP_BENCHMARK_JSON.
 /// Default path: $SUYU_RECOMP_EXECUTION_JSON, else `{LogDir}/recomp_execution.json`
 /// (Linux: ~/.local/share/suyu/log/recomp_execution.json unless portable `user/`).
 /// WriteRecompExecutionJson keeps `std::filesystem::path` (no narrow `.string()`
