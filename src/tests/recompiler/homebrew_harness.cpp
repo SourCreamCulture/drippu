@@ -1051,9 +1051,10 @@ static void run_one(const Case* cs, uint64_t x0, uint64_t x1, uint64_t x2, uint6
     if (cs->kind == K_Ands64) {
         expect_eq("ands.z", c.z, (want == 0));
         expect_eq("ands.n", c.n, (want >> 63) & 1);
-        /* C/V: ARM leaves them unchanged when the shifter amount is 0. */
-        expect_eq("ands.c_unchanged", c.c, preset_c);
-        expect_eq("ands.v_unchanged", c.v, 1);
+        /* A64/Dynarmic write C=V=0. preset_c/v start 1 on most trials so a
+           stale leave-C/V-alone emit fails these. */
+        expect_eq("ands.c_cleared", c.c, 0);
+        expect_eq("ands.v_cleared", c.v, 0);
     }
 }
 

@@ -184,7 +184,7 @@ inline std::vector<RefBlock> ReferenceBlocks() {
          })},
         {"logic_flags", kOffInsn + 2 * kInsnStride,
          park({
-             EncLogicalShifted(true, 3, false, 0, 1, 2, 0, 0), // ANDS
+             EncLogicalShifted(true, 3, false, 0, 1, 2, 0, 0), // ANDS; A64 C=V=0
          })},
         {"shift_div", kOffInsn + 3 * kInsnStride,
          park({

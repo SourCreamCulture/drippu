@@ -1588,7 +1588,7 @@ void FillThreadRegs(Kernel::Svc::ThreadContext& ctx, const u64 x[32]) {
     ctx.fp = x[29];
     ctx.lr = x[30];
     ctx.sp = x[31];
-    ctx.pstate = (1u << 29) | (1u << 28); // C=V=1 so ANDS cannot hide a clobber
+    ctx.pstate = (1u << 29) | (1u << 28); // C=V=1; ANDS must clear them (A64/Dynarmic)
 }
 
 u32 Nzcv(const Kernel::Svc::ThreadContext& ctx) {
@@ -1609,7 +1609,7 @@ u64 Gpr(const Kernel::Svc::ThreadContext& ctx, int i) {
 }
 
 bool SameGprsNzcv(const Kernel::Svc::ThreadContext& a, const Kernel::Svc::ThreadContext& b,
-                  const char* tag, u32 nzcv_mask = 0xF0000000u) {
+                  const char* tag) {
     bool ok = true;
     for (int i = 0; i < 32; ++i) {
         if (Gpr(a, i) != Gpr(b, i)) {
@@ -1622,9 +1622,9 @@ bool SameGprsNzcv(const Kernel::Svc::ThreadContext& a, const Kernel::Svc::Thread
         Fail(std::string(tag) + " pc aot=" + std::to_string(a.pc) + " dyn=" + std::to_string(b.pc));
         ok = false;
     }
-    if ((Nzcv(a) & nzcv_mask) != (Nzcv(b) & nzcv_mask)) {
-        Fail(std::string(tag) + " nzcv aot=" + std::to_string(Nzcv(a) & nzcv_mask) +
-             " dyn=" + std::to_string(Nzcv(b) & nzcv_mask));
+    if (Nzcv(a) != Nzcv(b)) {
+        Fail(std::string(tag) + " nzcv aot=" + std::to_string(Nzcv(a)) +
+             " dyn=" + std::to_string(Nzcv(b)));
         ok = false;
     }
     return ok;
@@ -1694,8 +1694,19 @@ void ScenarioInsnCorrectness(StackFixture& f) {
             Fail(std::string(tag) + " svc aot=" + std::to_string(aot.svc) +
                  " dyn=" + std::to_string(dyn.svc));
         }
-        SameGprsNzcv(aot.ctx, dyn.ctx, tag,
-                     std::string_view(blk.name) == "logic_flags" ? 0xC0000000u : 0xF0000000u);
+        SameGprsNzcv(aot.ctx, dyn.ctx, tag);
+        if (std::string_view(blk.name) == "logic_flags") {
+            // FillThreadRegs presets C=V=1. A64/Dynarmic ANDS write C=V=0.
+            // This fails if AOT left those bits stale even when N/Z match.
+            if ((Nzcv(aot.ctx) & 0x30000000u) != 0) {
+                Fail(std::string(tag) + " AOT ANDS left C/V stale nzcv=" +
+                     std::to_string(Nzcv(aot.ctx)));
+            }
+            if ((Nzcv(dyn.ctx) & 0x30000000u) != 0) {
+                Fail(std::string(tag) + " Dynarmic ANDS C/V not 0 nzcv=" +
+                     std::to_string(Nzcv(dyn.ctx)));
+            }
+        }
         if (aot.mem0 != dyn.mem0 || aot.mem8 != dyn.mem8) {
             Fail(std::string(tag) + " mem mismatch");
         }
@@ -1769,7 +1780,7 @@ void ScenarioInsnCorrectness(StackFixture& f) {
     }
 
     ScenarioPass("Translate AOT vs Dynarmic instruction correctness (edge + random)", before);
-    Pass("ANDS C/V: AOT follows ARM (unchanged at shift#0); Dynarmic NZCV compare is N/Z only");
+    Pass("ANDS C/V: AOT writes 0 (A64/Dynarmic); full NZCV vs Dynarmic; stale C/V fails");
 }
 
 void ExportExecutionJson(const fs::path& path) {
