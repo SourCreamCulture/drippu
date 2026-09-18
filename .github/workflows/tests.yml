@@ -49,7 +49,7 @@ jobs:
       - name: Build tests
         run: cmake --build build --target tests recomp_stack_harness -j4
       - name: Run tests
-        run: ctest --test-dir build --output-on-failure -R '^(tests|recomp_stack_harness)$'
+        run: stdbuf -oL -eL ctest --test-dir build --output-on-failure -V --timeout 180 -R '^(tests|recomp_stack_harness)$'
 
   tests-sanitizer:
     name: Linux x86-64 sanitizers

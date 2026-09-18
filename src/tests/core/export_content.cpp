@@ -97,3 +97,14 @@ TEST_CASE("DecideUpdateBake fails closed without Program NCA or incomplete BKTR"
         {{FileSys::ExportBakeItem::Kind::Update, "Update v1.0.0", "NAND"}}, false, 0);
     REQUIRE(mixed.empty());
 }
+
+TEST_CASE("AOC Count and List agree on base title id including update NPDM", "[export]") {
+    constexpr u64 base = 0x0100AABBCCDDE000ULL;
+    constexpr u64 update_npdm = base | 0x800;
+    constexpr u64 aoc = FileSys::GetAOCBaseTitleID(base) + 4;
+
+    REQUIRE(FileSys::GetBaseTitleID(update_npdm) == base);
+    REQUIRE(FileSys::GetBaseTitleID(aoc) == FileSys::GetBaseTitleID(update_npdm));
+    REQUIRE(FileSys::ClassifyTitleRelation(FileSys::GetBaseTitleID(update_npdm), aoc) ==
+            FileSys::TitleRelation::Aoc);
+}

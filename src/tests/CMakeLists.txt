@@ -28,7 +28,8 @@ create_target_directory_groups(tests)
 target_link_libraries(tests PRIVATE common core input_common video_core)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
-add_test(NAME tests COMMAND tests)
+add_test(NAME tests COMMAND tests --durations yes)
+set_tests_properties(tests PROPERTIES TIMEOUT 180)
 
 # Header-only exporter smoke; also configurable as a standalone CMake project
 # from src/tests/recompiler (PR CI does that so it needs no emulator deps).

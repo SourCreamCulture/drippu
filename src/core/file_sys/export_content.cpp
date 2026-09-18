@@ -281,13 +281,13 @@ bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequ
 
     if (request.rom_path.empty()) {
         error = "No ROM path";
-        status = FormatExportBakeStatus(bake_items);
+        status = error;
         return false;
     }
 
     if (!RegisterPath(request.rom_path, true)) {
         error = "Could not open the base ROM";
-        status = FormatExportBakeStatus(bake_items);
+        status = error;
         return false;
     }
 
@@ -338,7 +338,7 @@ bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequ
 
     if (title_id == 0) {
         error = "Could not determine title ID";
-        status = FormatExportBakeStatus(bake_items);
+        status = error;
         return false;
     }
 
@@ -346,9 +346,7 @@ bool ExportContentSession::Resolve(Core::System& system, const ExportContentRequ
         if (error.empty()) {
             error = "Failed to apply update/DLC patches";
         }
-        if (status.empty()) {
-            status = FormatExportBakeStatus(bake_items);
-        }
+        status = error;
         return false;
     }
 
