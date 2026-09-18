@@ -102,15 +102,34 @@ class TestControl2 {
 public:
     TestControl2() = default;
 
-    void DoWork1() {
-        trap2 = false;
+    // Like WaitForTimingIdle: bounded wait, then the caller fails closed.
+    // On expiry, do not YieldTo the partner (that can deadlock the fiber
+    // mutex so join() never returns and REQUIRE_FALSE never runs). Yield
+    // back to this thread's home fiber and return.
+    bool WaitForHandshakeClear(std::atomic<bool>& flag) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (trap.load()) {
-            if (std::chrono::steady_clock::now() >= deadline) {
+        while (flag.load()) {
+            if (handshake_timeout.load() || std::chrono::steady_clock::now() >= deadline) {
                 handshake_timeout = true;
-                break;
+                trap.store(false);
+                trap2.store(false);
+                return false;
             }
             std::this_thread::yield();
+        }
+        return !handshake_timeout.load();
+    }
+
+    void YieldHome(const std::shared_ptr<Fiber>& from) {
+        const u32 id = thread_ids.Get();
+        Fiber::YieldTo(from, *thread_fibers[id]);
+    }
+
+    void DoWork1() {
+        trap2 = false;
+        if (!WaitForHandshakeClear(trap)) {
+            YieldHome(fiber1);
+            return;
         }
         for (u32 i = 0; i < 12000; i++) {
             value1 += i;
@@ -123,13 +142,9 @@ public:
     }
 
     void DoWork2() {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (trap2.load()) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                handshake_timeout = true;
-                break;
-            }
-            std::this_thread::yield();
+        if (!WaitForHandshakeClear(trap2)) {
+            YieldHome(fiber2);
+            return;
         }
         value2 = 2000;
         trap = false;

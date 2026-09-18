@@ -52,17 +52,18 @@ jobs:
         working-directory: build
         run: |
           set -euo pipefail
-          # ctest captures the tests binary, so a hang only flushed Catch2's
-          # seed line (see 346d452 job 105416371556). Invoke Catch2 directly
-          # with line-buffered -s / --durations so the hanging case is named.
+          # Do not use Catch2 -s: it dumps millions of PASSED lines (RingBuffer)
+          # and still does not name hangs (case headers are lazy; InterExchange
+          # join()s before REQUIRE). A testCaseStarting listener prints+flushes
+          # the name at start. --order decl matches --list-tests order.
           echo '=== Catch2 --list-tests ==='
-          stdbuf -oL -eL ./bin/tests --list-tests
+          stdbuf -oL -eL ./bin/tests --list-tests --order decl
           echo '=== Catch2 [export] (this PR helpers; must finish quickly) ==='
           timeout --foreground --kill-after=10s 30s \
-            stdbuf -oL -eL ./bin/tests -s --durations yes "[export]"
+            stdbuf -oL -eL ./bin/tests --durations yes --order decl "[export]"
           echo '=== Catch2 ~[export] ==='
           timeout --foreground --kill-after=10s 90s \
-            stdbuf -oL -eL ./bin/tests -s --durations yes "~[export]"
+            stdbuf -oL -eL ./bin/tests --durations yes --order decl "~[export]"
           echo '=== recomp_stack_harness ==='
           timeout --foreground --kill-after=10s 60s \
             stdbuf -oL -eL ./bin/recomp_stack_harness
