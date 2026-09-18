@@ -49,7 +49,23 @@ jobs:
       - name: Build tests
         run: cmake --build build --target tests recomp_stack_harness -j4
       - name: Run tests
-        run: stdbuf -oL -eL ctest --test-dir build --output-on-failure -V --timeout 180 -R '^(tests|recomp_stack_harness)$'
+        working-directory: build
+        run: |
+          set -euo pipefail
+          # ctest captures the tests binary, so a hang only flushed Catch2's
+          # seed line (see 346d452 job 105416371556). Invoke Catch2 directly
+          # with line-buffered -s / --durations so the hanging case is named.
+          echo '=== Catch2 --list-tests ==='
+          stdbuf -oL -eL ./bin/tests --list-tests
+          echo '=== Catch2 [export] (this PR helpers; must finish quickly) ==='
+          timeout --foreground --kill-after=10s 30s \
+            stdbuf -oL -eL ./bin/tests -s --durations yes "[export]"
+          echo '=== Catch2 ~[export] ==='
+          timeout --foreground --kill-after=10s 90s \
+            stdbuf -oL -eL ./bin/tests -s --durations yes "~[export]"
+          echo '=== recomp_stack_harness ==='
+          timeout --foreground --kill-after=10s 60s \
+            stdbuf -oL -eL ./bin/recomp_stack_harness
 
   tests-sanitizer:
     name: Linux x86-64 sanitizers

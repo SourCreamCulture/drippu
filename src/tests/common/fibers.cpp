@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -103,8 +104,14 @@ public:
 
     void DoWork1() {
         trap2 = false;
-        while (trap.load())
-            ;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (trap.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                handshake_timeout = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
         for (u32 i = 0; i < 12000; i++) {
             value1 += i;
         }
@@ -116,8 +123,14 @@ public:
     }
 
     void DoWork2() {
-        while (trap2.load())
-            ;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (trap2.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                handshake_timeout = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
         value2 = 2000;
         trap = false;
         Fiber::YieldTo(fiber2, *fiber1);
@@ -152,6 +165,7 @@ public:
     u32 value2{};
     std::atomic<bool> trap{true};
     std::atomic<bool> trap2{true};
+    std::atomic<bool> handshake_timeout{false};
     ThreadIds thread_ids;
     std::vector<std::shared_ptr<Common::Fiber>> thread_fibers;
     std::shared_ptr<Common::Fiber> fiber1;
@@ -192,6 +206,7 @@ TEST_CASE("Fibers::InterExchange", "[common]") {
     }};
     thread1.join();
     thread2.join();
+    REQUIRE_FALSE(test_control.handshake_timeout);
     REQUIRE(test_control.assert1);
     REQUIRE(test_control.assert2);
     REQUIRE(test_control.assert3);
